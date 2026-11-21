@@ -1017,6 +1017,12 @@ MHW_RNG_PLUGIN_EXPORT bool MhwRngPlugin_Init(const MhwRngHostApi* host, MhwRngPl
                            &FormatEndemicSlotStatus,
                            nullptr);
     host->RegisterSiteMeta(selfId,
+                           kRvaFieldIntraTierRoll,
+                           "endemic.field_size",
+                           u8"共享浮点区间随机 (由 endemic 仅过滤环境生物刷新)",
+                           &FormatEndemicSlotStatus,
+                           nullptr);
+    host->RegisterSiteMeta(selfId,
                            kRvaCaptureIntraTierRoll,
                            "endemic.cap_size",
                            u8"环境生物捕获时档内精确尺寸抽取 (由 endemic 插件托管)",
