@@ -2,7 +2,7 @@
 
 - **插件标识**：`endemic`（编译产物 `rng_endemic.dll`，版本 `1.0.0`）
 - **源码位置**：[endemic_plugin.cpp](endemic_plugin.cpp)
-- **宿主依赖**：`mhw_rng.dll`（Plugin SDK `kMhwRngApiVersion == 2`，头文件 [mhw_rng_api.h](include/mhw_rng_api.h)）
+- **宿主依赖**：`mhw_rng.dll`（Plugin SDK `kMhwRngApiVersion == 3`，头文件 [mhw_rng_api.h](include/mhw_rng_api.h)）
 - **接管调用点**：`0x166CFE1`（档位抽取）、`0x0672FBC`（地图刷新档内插值，仅过滤环境生物调用来源）、`0x1669CB6`（捕获时档内插值）
 
 本文档说明 `rng_endemic` 插件所依据的原版环境生物尺寸逆向逻辑、共享随机函数的调用栈过滤机制、按物种条件分流方式以及聊天命令参考。
@@ -16,7 +16,7 @@
 ### 1. 两条完整调用路径
 1. **地图刷新路径（常规环境生物、鱼类等在场上生成时定型）**：
    - `FUN_141d2a1e0(uAnimal* rcx)`（`0x141D2A1E0`）从 `uAnimal + 0x1AF0` 读取 `animalId`，从 `+0x1AF4` 读取变种编号 `animalType`。
-   - 调用 `0x140271840` $\rightarrow$ `FUN_14166ccc0`（**调用点 `RVA 0x166CFE1`**）抽取大小金档位 `tier`（`0 / 1 / 2`）。
+   - 调用 `0x140271840` → `FUN_14166ccc0`（**调用点 `RVA 0x166CFE1`**）抽取大小金档位 `tier`（`0 / 1 / 2`）。
    - 分别调用 `FUN_14166b8c0` 与 `FUN_14166b7f0` 读取 `rAnimalSize`（`0x145012740`）中该物种在 `tier` 档对应的倍率下界与上界 `[minScale, maxScale]`。
    - 调用共享浮点区间随机函数 `FUN_140672f90(minScale, maxScale)`（**调用点 `RVA 0x0672FBC`**，调用返回地址为 `0x1D2A472`，特殊地区路径为 `0x1D2A3CC`），将结果截断保留两位小数写入 `*(float*)(uAnimal + 0x11BC)`。
 2. **捕获时重抽路径（`sizeMode == 3` 的特殊物种，捕获瞬间才决定尺寸）**：
@@ -92,14 +92,14 @@ return 1; // 兜底返回普通档
 本插件目录自带本地 SDK 头文件副本与独立构建脚本，可作为单独的 Git 仓库维护：
 
 - `endemic_plugin.cpp`：插件主源码
-- `include/mhw_rng_api.h`：本地携带的 `mhw_rng` Plugin SDK v2 头文件副本
+- `include/mhw_rng_api.h`：本地携带的 `mhw_rng` Plugin SDK v3 头文件副本
 - `sync_sdk.bat`：从核心框架目录更新 `include\mhw_rng_api.h`
 - `build.bat`：自动查找 MSVC x64 工具链并输出 `build\rng_endemic.dll`
 
 常用命令：
 ```bat
 :: 1. 同步最新 SDK 头文件（默认查找 ..\..\include 或 %MHW_RNG_SDK_DIR%）
-sync_sdk.bat D:\path\to\mhw-rng
+sync_sdk.bat <path-to-mhw-rng>
 
 :: 2. 独立编译至 build\rng_endemic.dll
 build.bat
