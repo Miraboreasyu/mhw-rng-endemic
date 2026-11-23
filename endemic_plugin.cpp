@@ -1,21 +1,21 @@
 // ============================================================================
 //  MHW RNG Official Plugin: Endemic Life Size & Crown Controller (`rng_endemic.dll`)
-//  Version : 1.0.0 (SDK v2 Reference Implementation)
+//  Version : 1.1.0 (SDK v3.1)
 //  Targets :
 //    1. `RVA 0x166CFE1` (`FUN_14166ccc0` @ 0x14166CCC0)
 //       Crown Tier Roll (`0 = Mini Crown`, `1 = Normal`, `2 = Giant Crown`),
 //       shared by both field spawns (`0x141D2A1E0 -> 0x140271840`) and
 //       capture-time species rolls (`0x141D28C00 -> 0x141669AC0`).
-//    2. `RVA 0x0672FBC` (`FUN_140672f90` @ 0x140672F90)
-//       Field-spawn intra-tier linear size interpolation (strictly guarded on
-//       `slotPtr[10] == exeBase + 0x1D2A472` or `0x1D2A3CC` so non-endemic
-//       callers of `FUN_140672f90` are never affected).
+//    2. `RVA 0x1D2A472` / `RVA 0x1D2A3CC` (`FUN_141d2a1e0` calling `FUN_140672f90`)
+//       Field-spawn intra-tier linear size interpolation (directly unwrapped from
+//       the microkernel's built-in `0x0672FBC` transparent wrapper so non-endemic
+//       callers of `FUN_140672f90` never enter this plugin).
 //    3. `RVA 0x1669CB6` (`0x141669AC0`)
 //       Capture-time intra-tier linear size interpolation for species whose
 //       size is determined on capture (`sizeMode == 3`).
 //
 //  Architecture & SDK Best-Practice Highlights:
-//    - Zero extra game hooks: operates purely via microkernel `RegisterSlotHook`.
+//    - Zero extra game hooks: operates purely via microkernel `RegisterSlotHookEx`.
 //    - Reads live `SizeSetData::mSizeProbability[3]` + active Felyne food /
 //      Bounty bonuses from `0x14166CCC0`'s stack frame, computing exact legal
 //      midpoints so disabled 0-probability crown tiers are skipped cleanly and
@@ -42,16 +42,15 @@ namespace {
 
 // Verified MHW:I 15.23 (Steam 15539686) RVAs & Offsets:
 constexpr std::uint32_t  kRvaCrownTierRoll         = 0x166CFE1U; // `FUN_14166ccc0` `CALL MtRandom::nrand`
-constexpr std::uint32_t  kRvaFieldIntraTierRoll    = 0x0672FBCU; // `FUN_140672f90` `CALL MtRandom::nrand`
-constexpr std::uint32_t  kRvaCaptureIntraTierRoll  = 0x1669CB6U; // `0x141669AC0`   `CALL MtRandom::nrand`
+constexpr std::uint32_t  kRvaFieldRangeStd         = 0x1D2A472U; // `0x141D2A1E0` -> `CALL 0x140672f90` (unwrapped via 0x0672FBC)
+constexpr std::uint32_t  kRvaFieldRangeSpec        = 0x1D2A3CCU; // `0x141D2A1E0` -> `CALL 0x140672f90` (special region spawn)
+constexpr std::uint32_t  kRvaCaptureIntraTierRoll  = 0x1669CB6U; // `0x141669AC0` `CALL MtRandom::nrand`
 
-// Verified caller return RVAs for stack-frame validation:
+// Verified caller return RVAs for stack-frame validation in `FUN_14166ccc0`:
 constexpr std::uintptr_t kRvaCallerCaptureRollRet  = 0x1669C19U; // `0x141669AC0` -> `CALL 0x14166ccc0`
 constexpr std::uintptr_t kRvaCallerFieldWrapLo     = 0x0271840U; // `0x140271840` (`nAnimal::SizeSetData::ctor`) start
 constexpr std::uintptr_t kRvaCallerFieldWrapHi     = 0x0271960U; // `0x140271840` end
 constexpr std::uintptr_t kRvaCallerFieldTailRet    = 0x1D2A407U; // `0x141D2A1E0` -> `CALL 0x140271840` (tail-jmp to 0x14166CCC0)
-constexpr std::uintptr_t kRvaCallerFieldRangeStd   = 0x1D2A472U; // `0x141D2A1E0` -> `CALL 0x140672f90` (standard field spawn)
-constexpr std::uintptr_t kRvaCallerFieldRangeSpec  = 0x1D2A3CCU; // `0x141D2A1E0` -> `CALL 0x140672f90` (special region spawn)
 
 // Verified `rAnimalSize` (`DAT_145012740`) & `uAnimal` offsets:
 constexpr std::uintptr_t kRvaAnimalSizeGlobalPtr   = 0x5012740U;
@@ -78,7 +77,6 @@ struct EndemicPolicy {
     std::uint32_t targetTier   = 1U;              // 0 = Mini, 1 = Normal, 2 = Giant
     double        intraPct     = 50.0;            // [0.0 .. 100.0] position inside target tier
     float         exactValue   = 1.0f;            // Target scale or target cm
-    std::string   summaryCn;
 };
 
 struct AnimalSizeRow {
@@ -109,10 +107,14 @@ struct ThreadLocalEndemicCtx {
     bool          valid         = false;
     bool          isCapturePath = false;
     bool          hasExactIntra = false;
+    bool          wasLocked     = false;
+    bool          validProbs    = false;
     std::uint32_t animalId      = 0U;
     std::uint32_t animalType    = 0U;
     std::uint32_t chosenTier    = 1U;
     std::uint32_t exactIntraU32 = 0x80000000U;
+    float         effProb[3]{};
+    float         totalBase     = 0.0f;
     AnimalSizeRow sizeRow{};
 };
 
@@ -129,6 +131,10 @@ EndemicHistoryEntry        g_history[kHistoryCap]{};
 std::size_t                g_historyCount = 0U;
 
 thread_local ThreadLocalEndemicCtx tls_lastRoll{};
+
+inline bool IsEn() noexcept {
+    return MhwRng_HostIsEnglish(g_host);
+}
 
 // ============================================================================
 //  String, Formatting & Selector Helpers
@@ -163,11 +169,32 @@ std::string FormatSpeciesCode(std::uint32_t animalId, std::uint32_t animalType) 
     return buf;
 }
 
-const char* TierNameCn(std::uint32_t tier) noexcept {
+const char* TierName(std::uint32_t tier, bool en) noexcept {
     switch (tier) {
-        case 0U: return u8"小金";
-        case 2U: return u8"大金";
-        default: return u8"普通";
+        case 0U: return en ? "Mini"   : u8"小金";
+        case 2U: return en ? "Giant"  : u8"大金";
+        default: return en ? "Normal" : u8"普通";
+    }
+}
+
+std::string FormatPolicySummary(const EndemicPolicy& p, bool en) {
+    char buf[80]{};
+    switch (p.mode) {
+        case PolicyMode::kFixedTier:
+            if (en) {
+                std::snprintf(buf, sizeof(buf), "%s crown (intra %.0f%%)", TierName(p.targetTier, true), p.intraPct);
+            } else {
+                std::snprintf(buf, sizeof(buf), u8"%s档(档内%.0f%%)", TierName(p.targetTier, false), p.intraPct);
+            }
+            return buf;
+        case PolicyMode::kExactScale:
+            std::snprintf(buf, sizeof(buf), en ? "Exact scale=%.2fx" : u8"精确倍率=%.2fx", p.exactValue);
+            return buf;
+        case PolicyMode::kExactCm:
+            std::snprintf(buf, sizeof(buf), en ? "Exact size=%.2fcm" : u8"精确查表尺寸=%.2fcm", p.exactValue);
+            return buf;
+        default:
+            return en ? "Unlocked (vanilla)" : u8"未锁定(正常随机)";
     }
 }
 
@@ -467,23 +494,59 @@ std::uint32_t ComputeIntraTierU32(const EndemicPolicy& pol, std::uint32_t tier) 
 }
 
 // ============================================================================
-//  Three Pull-Mode Synchronous Slot Hooks (`0x166CFE1`, `0x0672FBC`, `0x1669CB6`)
+//  Synchronous Slot Hooks (`0x166CFE1`, `0x1D2A472`, `0x1D2A3CC`, `0x1669CB6`)
 // ============================================================================
 
-void __fastcall OnEndemicCrownTierDraw(const MhwRngDrawContext* ctx,
-                                       MhwRngHookDecision* ioDecision,
-                                       void*) {
+void PushHistoryFromPostLocked(const ThreadLocalEndemicCtx& t, std::uint32_t tier) {
+    if (!t.valid) return;
+    for (std::size_t i = kHistoryCap - 1U; i > 0U; --i) {
+        g_history[i] = g_history[i - 1U];
+    }
+    if (g_historyCount < kHistoryCap) ++g_historyCount;
+
+    EndemicHistoryEntry& h = g_history[0];
+    h.validSpecies  = true;
+    h.validRow      = t.sizeRow.valid;
+    h.isCapturePath = t.isCapturePath;
+    h.hasRolledSize = false;
+    h.animalId      = t.animalId;
+    h.animalType    = t.animalType;
+    h.rolledTier    = tier;
+    h.baseSizeCm    = t.sizeRow.baseSizeCm;
+    h.minScale      = t.sizeRow.minScale;
+    h.maxScale      = t.sizeRow.maxScale;
+    h.rolledScale   = 1.0f;
+}
+
+std::uint32_t SimulateCrownTierRaw(const float effProb[3], float totalBase, std::uint32_t u32Val) noexcept {
+    if (!(totalBase > kProbEps)) return 1U;
+    const float roll = static_cast<float>(static_cast<std::uint64_t>(u32Val)) * (1.0f / 4294967296.0f) * totalBase;
+    float cum = 0.0f;
+    for (std::uint32_t t = 0U; t < 3U; ++t) {
+        if (effProb[t] <= 0.0f) continue;
+        cum += effProb[t];
+        if (roll <= cum) return t;
+    }
+    return 1U;
+}
+
+void __fastcall OnEndemicCrownTierDrawPre(const MhwRngDrawContext* ctx,
+                                          MhwRngHookDecision* ioDecision,
+                                          void*) {
     if (!ioDecision) return;
 
     LiveCrownTierContext sc{};
     ReadCrownTierContextSEH(ctx, sc);
 
-    // Reset per-thread handoff state for the upcoming intra-tier roll
+    // Reset per-thread handoff state for the upcoming intra-tier roll & post-draw callback
     tls_lastRoll               = ThreadLocalEndemicCtx{};
     tls_lastRoll.valid         = sc.validSpecies;
     tls_lastRoll.isCapturePath = sc.isCapturePath;
     tls_lastRoll.animalId      = sc.animalId;
     tls_lastRoll.animalType    = sc.animalType;
+    tls_lastRoll.validProbs    = sc.validProbs;
+    tls_lastRoll.totalBase     = sc.totalBase;
+    std::memcpy(tls_lastRoll.effProb, sc.effProb, sizeof(tls_lastRoll.effProb));
     tls_lastRoll.sizeRow       = sc.sizeRow;
 
     std::lock_guard<std::mutex> lk(g_stateMx);
@@ -492,9 +555,10 @@ void __fastcall OnEndemicCrownTierDraw(const MhwRngDrawContext* ctx,
     std::uint32_t chosenTier = 1U;
     if (pol->mode == PolicyMode::kFixedTier) {
         const std::uint32_t u32 = SolveCrownTierU32(sc, pol->targetTier, chosenTier);
-        ioDecision->action = kMhwRngActionReturnValue;
-        ioDecision->condId = pol->condId;
-        ioDecision->value0 = u32;
+        ioDecision->action      = kMhwRngActionReturnValue;
+        ioDecision->condId      = pol->condId;
+        ioDecision->value0      = u32;
+        tls_lastRoll.wasLocked  = true;
         tls_lastRoll.chosenTier = chosenTier;
     } else if (pol->mode == PolicyMode::kExactScale || pol->mode == PolicyMode::kExactCm) {
         float targetScale = pol->exactValue;
@@ -503,7 +567,6 @@ void __fastcall OnEndemicCrownTierDraw(const MhwRngDrawContext* ctx,
                               ? (pol->exactValue / sc.sizeRow.baseSizeCm)
                               : 1.0f;
         }
-        // Choose legal tier whose `[tierMin, tierMax]` is closest to `targetScale`
         std::uint32_t bestTier = 1U;
         float bestDist = 1e9f;
         if (sc.sizeRow.valid) {
@@ -523,9 +586,10 @@ void __fastcall OnEndemicCrownTierDraw(const MhwRngDrawContext* ctx,
         }
 
         const std::uint32_t u32 = SolveCrownTierU32(sc, bestTier, chosenTier);
-        ioDecision->action = kMhwRngActionReturnValue;
-        ioDecision->condId = pol->condId;
-        ioDecision->value0 = u32;
+        ioDecision->action      = kMhwRngActionReturnValue;
+        ioDecision->condId      = pol->condId;
+        ioDecision->value0      = u32;
+        tls_lastRoll.wasLocked  = true;
         tls_lastRoll.chosenTier = chosenTier;
 
         if (sc.sizeRow.valid) {
@@ -536,39 +600,40 @@ void __fastcall OnEndemicCrownTierDraw(const MhwRngDrawContext* ctx,
             tls_lastRoll.exactIntraU32 = FractionToTierU32(frac, chosenTier == 2U);
         }
     } else {
-        // Unlocked: still step deterministically if we want live telemetry on tier!
+        // Unlocked: let Selective/ObserveOnly execute pure vanilla RNG; Post callback captures telemetry.
         ioDecision->action = kMhwRngActionUseCondition;
         ioDecision->condId = 0U;
-        if (ctx && ctx->DrawDeterministic && sc.validProbs) {
-            const std::uint32_t detU32 = ctx->DrawDeterministic(kRvaCrownTierRoll, 0U);
-            chosenTier = SimulateCrownTier(sc, detU32);
-            ioDecision->action = kMhwRngActionReturnValue;
-            ioDecision->condId = 0U;
-            ioDecision->value0 = detU32;
-            tls_lastRoll.chosenTier = chosenTier;
+    }
+}
+
+void __fastcall OnEndemicCrownTierDrawPost(const MhwRngDrawContext* ctx,
+                                           MhwRngHookDecision*,
+                                           void*) {
+    if (!ctx) return;
+    if (!tls_lastRoll.valid) {
+        LiveCrownTierContext sc{};
+        if (ReadCrownTierContextSEH(ctx, sc)) {
+            tls_lastRoll.valid         = sc.validSpecies;
+            tls_lastRoll.isCapturePath = sc.isCapturePath;
+            tls_lastRoll.animalId      = sc.animalId;
+            tls_lastRoll.animalType    = sc.animalType;
+            tls_lastRoll.validProbs    = sc.validProbs;
+            tls_lastRoll.totalBase     = sc.totalBase;
+            std::memcpy(tls_lastRoll.effProb, sc.effProb, sizeof(tls_lastRoll.effProb));
+            tls_lastRoll.sizeRow       = sc.sizeRow;
         }
     }
+    if (!tls_lastRoll.valid) return;
 
-    // Push into recent endemic spawn/capture telemetry ring
-    if (sc.validSpecies) {
-        for (std::size_t i = kHistoryCap - 1U; i > 0U; --i) {
-            g_history[i] = g_history[i - 1U];
-        }
-        if (g_historyCount < kHistoryCap) ++g_historyCount;
-
-        EndemicHistoryEntry& h = g_history[0];
-        h.validSpecies  = true;
-        h.validRow      = sc.sizeRow.valid;
-        h.isCapturePath = sc.isCapturePath;
-        h.hasRolledSize = false;
-        h.animalId      = sc.animalId;
-        h.animalType    = sc.animalType;
-        h.rolledTier    = chosenTier;
-        h.baseSizeCm    = sc.sizeRow.baseSizeCm;
-        h.minScale      = sc.sizeRow.minScale;
-        h.maxScale      = sc.sizeRow.maxScale;
-        h.rolledScale   = 1.0f;
+    const bool isObserve = ((ctx->callFlags & kMhwRngDrawFlagObserveOnly) != 0U);
+    if (!tls_lastRoll.wasLocked || isObserve) {
+        tls_lastRoll.chosenTier = tls_lastRoll.validProbs
+                                      ? SimulateCrownTierRaw(tls_lastRoll.effProb, tls_lastRoll.totalBase, ctx->finalValue0)
+                                      : 1U;
     }
+
+    std::lock_guard<std::mutex> lk(g_stateMx);
+    PushHistoryFromPostLocked(tls_lastRoll, tls_lastRoll.chosenTier);
 }
 
 void HandleIntraTierRollCommon(MhwRngHookDecision* ioDecision,
@@ -600,7 +665,6 @@ void HandleIntraTierRollCommon(MhwRngHookDecision* ioDecision,
     ioDecision->condId = pol->condId;
     ioDecision->value0 = chosenU32;
 
-    // Back-fill rolled scale into `g_history[0]` when matching the most recent species
     if (haveSp && tls_lastRoll.sizeRow.valid && g_historyCount > 0U &&
         g_history[0].animalId == aid && g_history[0].animalType == atp) {
         const std::uint32_t t = std::min<std::uint32_t>(tls_lastRoll.chosenTier, 2U);
@@ -612,39 +676,18 @@ void HandleIntraTierRollCommon(MhwRngHookDecision* ioDecision,
     }
 }
 
-bool IsEndemicFieldRangeCallerSEH(const MhwRngDrawContext* ctx, bool& outIsStandardField) noexcept {
-    outIsStandardField = false;
-    if (!ctx || !ctx->returnAddrSlot || !ctx->exeBase) return false;
-    __try {
-        // `FUN_140672f90` executes `SUB RSP, 0x48` (no pushes) -> caller return address is at `slotPtr[10]`!
-        const auto* slotPtr = static_cast<const std::uintptr_t*>(ctx->returnAddrSlot);
-        const std::uintptr_t callerRet = slotPtr[10];
-        if (callerRet == (ctx->exeBase + kRvaCallerFieldRangeStd)) {
-            outIsStandardField = true;
-            return true;
-        }
-        if (callerRet == (ctx->exeBase + kRvaCallerFieldRangeSpec)) {
-            outIsStandardField = false;
-            return true;
-        }
-        return false;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
+void __fastcall OnFieldStdIntraTierDraw(const MhwRngDrawContext*,
+                                        MhwRngHookDecision* ioDecision,
+                                        void*) {
+    if (!ioDecision) return;
+    HandleIntraTierRollCommon(ioDecision, true);
 }
 
-void __fastcall OnFieldIntraTierDraw(const MhwRngDrawContext* ctx,
-                                     MhwRngHookDecision* ioDecision,
-                                     void*) {
+void __fastcall OnFieldSpecIntraTierDraw(const MhwRngDrawContext*,
+                                         MhwRngHookDecision* ioDecision,
+                                         void*) {
     if (!ioDecision) return;
-    bool isStdField = false;
-    if (!IsEndemicFieldRangeCallerSEH(ctx, isStdField)) {
-        // Non-endemic caller of shared `FUN_140672f90`: leave 100% untouched!
-        ioDecision->action = kMhwRngActionUseCondition;
-        ioDecision->condId = 0U;
-        return;
-    }
-    HandleIntraTierRollCommon(ioDecision, isStdField);
+    HandleIntraTierRollCommon(ioDecision, false);
 }
 
 void __fastcall OnCaptureIntraTierDraw(const MhwRngDrawContext*,
@@ -659,14 +702,17 @@ bool __fastcall FormatEndemicSlotStatus(const MhwRngSlotSnapshot* snap,
                                         std::size_t bufCap,
                                         void*) {
     if (!snap || !outBuf || bufCap == 0U) return false;
+    const bool en = IsEn();
     std::lock_guard<std::mutex> lk(g_stateMx);
     if (snap->condId == 0U) {
         if (g_globalPolicy.mode != PolicyMode::kNone) {
-            std::snprintf(outBuf, bufCap, "%s", g_globalPolicy.summaryCn.c_str());
+            std::snprintf(outBuf, bufCap, "%s", FormatPolicySummary(g_globalPolicy, en).c_str());
             return true;
         }
         if (!g_speciesPolicies.empty()) {
-            std::snprintf(outBuf, bufCap, u8"按环境生物分流(%zu条专属规则)", g_speciesPolicies.size());
+            std::snprintf(outBuf, bufCap,
+                          en ? "Per-species rules (%zu active)" : u8"按环境生物分流(%zu条专属规则)",
+                          g_speciesPolicies.size());
             return true;
         }
         return false;
@@ -675,7 +721,7 @@ bool __fastcall FormatEndemicSlotStatus(const MhwRngSlotSnapshot* snap,
         if (p.condId == snap->condId && p.mode != PolicyMode::kNone) {
             std::snprintf(outBuf, bufCap, "%s: %s",
                           FormatSpeciesCode(p.animalId, p.animalType).c_str(),
-                          p.summaryCn.c_str());
+                          FormatPolicySummary(p, en).c_str());
             return true;
         }
     }
@@ -712,7 +758,6 @@ ParseResult ParsePolicyTokens(int argc,
     const std::string t0 = LowerAscii(argv[0]);
     const std::uint32_t condId = MakeSpeciesCondId(animalId, animalType);
 
-    // Detect reversed order such as `$rng endemic max ec059`
     if (argc >= 2 && t0 != "exact") {
         std::uint32_t tmpId = 0, tmpTp = 0;
         if (ParseSpeciesSelector(argv[argc - 1], tmpId, tmpTp)) {
@@ -734,9 +779,7 @@ ParseResult ParsePolicyTokens(int argc,
         double intra = 0.0;
         const ParseResult pr = parseOptionalIntra(0.0, intra);
         if (pr != ParseResult::kOk) return pr;
-        char sum[80]{};
-        std::snprintf(sum, sizeof(sum), u8"小金档(档内%.0f%%)", intra);
-        outPol = EndemicPolicy{PolicyMode::kFixedTier, animalId, animalType, condId, 0U, intra, 1.0f, sum};
+        outPol = EndemicPolicy{PolicyMode::kFixedTier, animalId, animalType, condId, 0U, intra, 1.0f};
         return ParseResult::kOk;
     }
 
@@ -744,9 +787,7 @@ ParseResult ParsePolicyTokens(int argc,
         double intra = 50.0;
         const ParseResult pr = parseOptionalIntra(50.0, intra);
         if (pr != ParseResult::kOk) return pr;
-        char sum[80]{};
-        std::snprintf(sum, sizeof(sum), u8"普通档(档内%.0f%%)", intra);
-        outPol = EndemicPolicy{PolicyMode::kFixedTier, animalId, animalType, condId, 1U, intra, 1.0f, sum};
+        outPol = EndemicPolicy{PolicyMode::kFixedTier, animalId, animalType, condId, 1U, intra, 1.0f};
         return ParseResult::kOk;
     }
 
@@ -754,13 +795,10 @@ ParseResult ParsePolicyTokens(int argc,
         double intra = 100.0;
         const ParseResult pr = parseOptionalIntra(100.0, intra);
         if (pr != ParseResult::kOk) return pr;
-        char sum[80]{};
-        std::snprintf(sum, sizeof(sum), u8"大金档(档内%.0f%%)", intra);
-        outPol = EndemicPolicy{PolicyMode::kFixedTier, animalId, animalType, condId, 2U, intra, 1.0f, sum};
+        outPol = EndemicPolicy{PolicyMode::kFixedTier, animalId, animalType, condId, 2U, intra, 1.0f};
         return ParseResult::kOk;
     }
 
-    // `exact <scale|pct%|cm>` or `exact:<val>`
     std::string exStr;
     if (t0 == "exact") {
         if (argc != 2) return ParseResult::kBadSyntax;
@@ -774,33 +812,25 @@ ParseResult ParsePolicyTokens(int argc,
             double cm = 0.0;
             if (!ParseDoubleStrict(exStr.substr(0U, exStr.size() - 2U).c_str(), cm)) return ParseResult::kBadSyntax;
             if (cm <= 0.0 || cm > 10000.0) return ParseResult::kOutOfRange;
-            char sum[80]{};
-            std::snprintf(sum, sizeof(sum), u8"精确查表尺寸=%.2fcm", cm);
-            outPol = EndemicPolicy{PolicyMode::kExactCm, animalId, animalType, condId, 1U, 50.0, static_cast<float>(cm), sum};
+            outPol = EndemicPolicy{PolicyMode::kExactCm, animalId, animalType, condId, 1U, 50.0, static_cast<float>(cm)};
             return ParseResult::kOk;
         }
         if (exStr.back() == '%') {
             double pct = 0.0;
             if (!ParseDoubleStrict(exStr.substr(0U, exStr.size() - 1U).c_str(), pct)) return ParseResult::kBadSyntax;
             if (pct < 30.0 || pct > 300.0) return ParseResult::kOutOfRange;
-            char sum[80]{};
-            std::snprintf(sum, sizeof(sum), u8"精确倍率=%.1f%%", pct);
-            outPol = EndemicPolicy{PolicyMode::kExactScale, animalId, animalType, condId, 1U, 50.0, static_cast<float>(pct / 100.0), sum};
+            outPol = EndemicPolicy{PolicyMode::kExactScale, animalId, animalType, condId, 1U, 50.0, static_cast<float>(pct / 100.0)};
             return ParseResult::kOk;
         }
         if (exStr.back() == 'x') exStr.pop_back();
         double val = 0.0;
         if (!ParseDoubleStrict(exStr.c_str(), val)) return ParseResult::kBadSyntax;
         if (val >= 0.3 && val <= 3.0) {
-            char sum[80]{};
-            std::snprintf(sum, sizeof(sum), u8"精确倍率=%.2fx", val);
-            outPol = EndemicPolicy{PolicyMode::kExactScale, animalId, animalType, condId, 1U, 50.0, static_cast<float>(val), sum};
+            outPol = EndemicPolicy{PolicyMode::kExactScale, animalId, animalType, condId, 1U, 50.0, static_cast<float>(val)};
             return ParseResult::kOk;
         }
         if (val >= 30.0 && val <= 300.0) {
-            char sum[80]{};
-            std::snprintf(sum, sizeof(sum), u8"精确倍率=%.1f%%", val);
-            outPol = EndemicPolicy{PolicyMode::kExactScale, animalId, animalType, condId, 1U, 50.0, static_cast<float>(val / 100.0), sum};
+            outPol = EndemicPolicy{PolicyMode::kExactScale, animalId, animalType, condId, 1U, 50.0, static_cast<float>(val / 100.0)};
             return ParseResult::kOk;
         }
         return ParseResult::kOutOfRange;
@@ -810,6 +840,7 @@ ParseResult ParsePolicyTokens(int argc,
 }
 
 void PrintEndemicHistory(bool showAll) {
+    const bool en = IsEn();
     EndemicHistoryEntry snap[kHistoryCap]{};
     std::size_t count = 0U;
     {
@@ -818,9 +849,15 @@ void PrintEndemicHistory(bool showAll) {
         for (std::size_t i = 0; i < count; ++i) snap[i] = g_history[i];
     }
     if (count == 0U) {
-        g_host->ChatPrint(showAll
-                              ? u8"[endemic] 尚无环境生物尺寸抽取记录；进入探索/任务刷出或捕获环境生物后自动记录"
-                              : u8"[endemic] 用法: `$rng endemic min|normal|max|exact 1.2x|exact 30cm` 或 `$rng endemic ec059 max`");
+        if (en) {
+            g_host->ChatPrint(showAll
+                                  ? "[endemic] No endemic size rolls recorded yet; enter a quest/expedition or capture one"
+                                  : "[endemic] Usage: `$rng endemic min|normal|max|exact 1.2x|exact 30cm` or `$rng endemic ec059 max`");
+        } else {
+            g_host->ChatPrint(showAll
+                                  ? u8"[endemic] 尚无环境生物尺寸抽取记录；进入探索/任务刷出或捕获环境生物后自动记录"
+                                  : u8"[endemic] 用法: `$rng endemic min|normal|max|exact 1.2x|exact 30cm` 或 `$rng endemic ec059 max`");
+        }
         return;
     }
 
@@ -828,24 +865,27 @@ void PrintEndemicHistory(bool showAll) {
     for (std::size_t i = 0; i < limit; ++i) {
         const auto& e = snap[i];
         const std::string code = FormatSpeciesCode(e.animalId, e.animalType);
-        const char* srcTag = e.isCapturePath ? u8"捕获" : u8"刷新";
+        const char* srcTag = e.isCapturePath ? (en ? "Cap" : u8"捕获") : (en ? "Spawn" : u8"刷新");
         if (e.validRow && e.baseSizeCm > 0.0f && e.hasRolledSize) {
-            g_host->ChatPrintf(u8"[endemic] %s#%zu %s [%s] | 允许:%.1f~%.1fcm | 抽出:%.2fcm(%.0f%%)",
-                               srcTag, i + 1U, code.c_str(), TierNameCn(e.rolledTier),
+            g_host->ChatPrintf(en ? "[endemic] %s#%zu %s [%s] | Allowed:%.1f~%.1fcm | Rolled:%.2fcm(%.0f%%)"
+                                  : u8"[endemic] %s#%zu %s [%s] | 允许:%.1f~%.1fcm | 抽出:%.2fcm(%.0f%%)",
+                               srcTag, i + 1U, code.c_str(), TierName(e.rolledTier, en),
                                e.baseSizeCm * e.minScale, e.baseSizeCm * e.maxScale,
                                e.baseSizeCm * e.rolledScale, e.rolledScale * 100.0f);
         } else if (e.validRow && e.baseSizeCm > 0.0f) {
-            g_host->ChatPrintf(u8"[endemic] %s#%zu %s [%s] | 允许:%.1f~%.1fcm",
-                               srcTag, i + 1U, code.c_str(), TierNameCn(e.rolledTier),
+            g_host->ChatPrintf(en ? "[endemic] %s#%zu %s [%s] | Allowed:%.1f~%.1fcm"
+                                  : u8"[endemic] %s#%zu %s [%s] | 允许:%.1f~%.1fcm",
+                               srcTag, i + 1U, code.c_str(), TierName(e.rolledTier, en),
                                e.baseSizeCm * e.minScale, e.baseSizeCm * e.maxScale);
         } else {
-            g_host->ChatPrintf(u8"[endemic] %s#%zu %s [%s]",
-                               srcTag, i + 1U, code.c_str(), TierNameCn(e.rolledTier));
+            g_host->ChatPrintf("[endemic] %s#%zu %s [%s]",
+                               srcTag, i + 1U, code.c_str(), TierName(e.rolledTier, en));
         }
     }
 }
 
 void PrintEndemicStatus() {
+    const bool en = IsEn();
     EndemicPolicy              globalSnap{};
     std::vector<EndemicPolicy> spSnaps;
     {
@@ -854,24 +894,27 @@ void PrintEndemicStatus() {
         spSnaps    = g_speciesPolicies;
     }
 
-    g_host->ChatPrintf(u8"[endemic] 全局策略: %s | 按物种专属规则: %zu 条",
-                       globalSnap.mode == PolicyMode::kNone ? u8"未锁定(正常随机)" : globalSnap.summaryCn.c_str(),
+    g_host->ChatPrintf(en ? "[endemic] Global: %s | Per-species rules: %zu"
+                          : u8"[endemic] 全局策略: %s | 按物种专属规则: %zu 条",
+                       FormatPolicySummary(globalSnap, en).c_str(),
                        spSnaps.size());
     const std::size_t showN = std::min<std::size_t>(spSnaps.size(), 4U);
     for (std::size_t i = 0; i < showN; ++i) {
         const auto& p = spSnaps[i];
-        g_host->ChatPrintf(u8"[endemic] 专属 %s -> %s",
+        g_host->ChatPrintf(en ? "[endemic] Rule %s -> %s" : u8"[endemic] 专属 %s -> %s",
                            FormatSpeciesCode(p.animalId, p.animalType).c_str(),
-                           p.summaryCn.c_str());
+                           FormatPolicySummary(p, en).c_str());
     }
     if (spSnaps.size() > showN) {
-        g_host->ChatPrintf(u8"[endemic] ...另有 %zu 条专属规则生效中", spSnaps.size() - showN);
+        g_host->ChatPrintf(en ? "[endemic] ...and %zu more rule(s) active" : u8"[endemic] ...另有 %zu 条专属规则生效中",
+                           spSnaps.size() - showN);
     }
     PrintEndemicHistory(false);
 }
 
 void __fastcall Cmd_Endemic(int argc, const char* const* argv, const char*, void*) {
     if (!g_host) return;
+    const bool en = IsEn();
     if (argc == 0) {
         PrintEndemicStatus();
         return;
@@ -887,9 +930,15 @@ void __fastcall Cmd_Endemic(int argc, const char* const* argv, const char*, void
         return;
     }
     if (a0 == "help" || a0 == "?") {
-        g_host->ChatPrint(u8"[endemic] 全局: `$rng endemic min|normal|max [0~100]` | `exact 1.2x` | `exact 30cm`");
-        g_host->ChatPrint(u8"[endemic] 按物种: `$rng endemic ec059 max` (全亚种) 或 `$rng endemic ec059_02 min` (单变种)");
-        g_host->ChatPrint(u8"[endemic] 记录/清理: `$rng endemic history` (查刷出代号与cm) | `clear` | `ec059 clear`");
+        if (en) {
+            g_host->ChatPrint("[endemic] Global: `$rng endemic min|normal|max [0~100]` | `exact 1.2x` | `exact 30cm`");
+            g_host->ChatPrint("[endemic] Species: `$rng endemic ec059 max` (all variants) or `$rng endemic ec059_02 min`");
+            g_host->ChatPrint("[endemic] History/Clear: `$rng endemic history` | `clear` | `ec059 clear`");
+        } else {
+            g_host->ChatPrint(u8"[endemic] 全局: `$rng endemic min|normal|max [0~100]` | `exact 1.2x` | `exact 30cm`");
+            g_host->ChatPrint(u8"[endemic] 按物种: `$rng endemic ec059 max` (全亚种) 或 `$rng endemic ec059_02 min` (单变种)");
+            g_host->ChatPrint(u8"[endemic] 记录/清理: `$rng endemic history` (查刷出代号与cm) | `clear` | `ec059 clear`");
+        }
         return;
     }
     if (a0 == "off" || a0 == "clear" || a0 == "reset") {
@@ -903,7 +952,8 @@ void __fastcall Cmd_Endemic(int argc, const char* const* argv, const char*, void
                                        [&](const EndemicPolicy& p) { return p.animalId == aid && p.animalType == atp; }),
                         g_speciesPolicies.end());
                 }
-                g_host->ChatPrintf(u8"[endemic] 已移除 %s 的专属尺寸规则", FormatSpeciesCode(aid, atp).c_str());
+                g_host->ChatPrintf(en ? "[endemic] Removed rule for %s" : u8"[endemic] 已移除 %s 的专属尺寸规则",
+                                   FormatSpeciesCode(aid, atp).c_str());
                 return;
             }
         }
@@ -913,17 +963,21 @@ void __fastcall Cmd_Endemic(int argc, const char* const* argv, const char*, void
             g_speciesPolicies.clear();
         }
         g_host->ClearSlotAllConditions(kRvaCrownTierRoll);
+        g_host->ClearSlotAllConditions(kRvaFieldRangeStd);
+        g_host->ClearSlotAllConditions(kRvaFieldRangeSpec);
         g_host->ClearSlotAllConditions(kRvaCaptureIntraTierRoll);
-        g_host->ChatPrint(u8"[endemic] 已清空全部环境生物尺寸规则 -> 恢复正常随机");
+        g_host->ChatPrint(en ? "[endemic] Cleared all endemic size rules -> vanilla RNG"
+                             : u8"[endemic] 已清空全部环境生物尺寸规则 -> 恢复正常随机");
         return;
     }
 
-    // 1. Check Per-Species Selector (`ec059`, `ec059_02`, `#59`, `59:2`)
     std::uint32_t aid = 0, atp = kAnyAnimalType;
     if (ParseSpeciesSelector(argv[0], aid, atp)) {
         const std::string code = FormatSpeciesCode(aid, atp);
         if (argc < 2) {
-            g_host->ChatPrintf(u8"[endemic] 用法: `$rng endemic %s <min|normal|max|exact 1.2x|clear>`", argv[0]);
+            g_host->ChatPrintf(en ? "[endemic] Usage: `$rng endemic %s <min|normal|max|exact 1.2x|clear>`"
+                                  : u8"[endemic] 用法: `$rng endemic %s <min|normal|max|exact 1.2x|clear>`",
+                               argv[0]);
             return;
         }
         const std::string sub = LowerAscii(argv[1]);
@@ -935,18 +989,20 @@ void __fastcall Cmd_Endemic(int argc, const char* const* argv, const char*, void
                                    [&](const EndemicPolicy& p) { return p.animalId == aid && p.animalType == atp; }),
                     g_speciesPolicies.end());
             }
-            g_host->ChatPrintf(u8"[endemic] 已移除 %s 的专属尺寸规则", code.c_str());
+            g_host->ChatPrintf(en ? "[endemic] Removed rule for %s" : u8"[endemic] 已移除 %s 的专属尺寸规则", code.c_str());
             return;
         }
 
         EndemicPolicy pol{};
         const ParseResult pr = ParsePolicyTokens(argc - 1, argv + 1, aid, atp, pol);
         if (pr == ParseResult::kOutOfRange) {
-            g_host->ChatPrint(u8"[endemic] 数值超出范围: 档内比例 `0~100`，倍率 `0.3~3.0` 或 `30%~300%`，厘米 `>0`");
+            g_host->ChatPrint(en ? "[endemic] Out of range: intra 0~100, scale 0.3~3.0 (30%~300%), cm > 0"
+                                 : u8"[endemic] 数值超出范围: 档内比例 `0~100`，倍率 `0.3~3.0` 或 `30%~300%`，厘米 `>0`");
             return;
         }
         if (pr != ParseResult::kOk) {
-            g_host->ChatPrint(u8"[endemic] 参数无效；支持 `min` / `normal` / `max` / `exact <值>` / `clear`");
+            g_host->ChatPrint(en ? "[endemic] Invalid args; use min / normal / max / exact <val> / clear"
+                                 : u8"[endemic] 参数无效；支持 `min` / `normal` / `max` / `exact <值>` / `clear`");
             return;
         }
 
@@ -962,25 +1018,29 @@ void __fastcall Cmd_Endemic(int argc, const char* const* argv, const char*, void
             }
             if (!updated) g_speciesPolicies.push_back(pol);
         }
-        g_host->ChatPrintf(u8"[endemic] 已设专属 %s -> %s (其它环境生物不受影响)",
-                           code.c_str(), pol.summaryCn.c_str());
+        g_host->ChatPrintf(en ? "[endemic] Set %s -> %s (other species unaffected)"
+                              : u8"[endemic] 已设专属 %s -> %s (其它环境生物不受影响)",
+                           code.c_str(), FormatPolicySummary(pol, en).c_str());
         return;
     }
 
-    // 2. Otherwise parse as Global Policy
     EndemicPolicy pol{};
     const ParseResult pr = ParsePolicyTokens(argc, argv, 0U, kAnyAnimalType, pol);
     if (pr == ParseResult::kReversedOrderHint) {
-        g_host->ChatPrintf(u8"[endemic] 顺序提示: 按物种锁定请把代号放前面，例如 `$rng endemic %s %s`",
+        g_host->ChatPrintf(en ? "[endemic] Order hint: put species first, e.g. `$rng endemic %s %s`"
+                              : u8"[endemic] 顺序提示: 按物种锁定请把代号放前面，例如 `$rng endemic %s %s`",
                            argv[argc - 1], argv[0]);
         return;
     }
     if (pr == ParseResult::kOutOfRange) {
-        g_host->ChatPrint(u8"[endemic] 数值超出范围: 档内比例 `0~100`，倍率 `0.3~3.0` 或 `30%~300%`，厘米 `>0`");
+        g_host->ChatPrint(en ? "[endemic] Out of range: intra 0~100, scale 0.3~3.0 (30%~300%), cm > 0"
+                             : u8"[endemic] 数值超出范围: 档内比例 `0~100`，倍率 `0.3~3.0` 或 `30%~300%`，厘米 `>0`");
         return;
     }
     if (pr != ParseResult::kOk) {
-        g_host->ChatPrintf(u8"[endemic] 未知参数 `%s`；输 `$rng endemic help` 查看用法", argv[0]);
+        g_host->ChatPrintf(en ? "[endemic] Unknown arg `%s`; type `$rng endemic help`"
+                              : u8"[endemic] 未知参数 `%s`；输 `$rng endemic help` 查看用法",
+                           argv[0]);
         return;
     }
 
@@ -988,15 +1048,71 @@ void __fastcall Cmd_Endemic(int argc, const char* const* argv, const char*, void
         std::lock_guard<std::mutex> lk(g_stateMx);
         g_globalPolicy = pol;
     }
-    g_host->ChatPrintf(u8"[endemic] 已设全局环境生物尺寸规则 -> %s", pol.summaryCn.c_str());
+    g_host->ChatPrintf(en ? "[endemic] Global endemic rule -> %s" : u8"[endemic] 已设全局环境生物尺寸规则 -> %s",
+                       FormatPolicySummary(pol, en).c_str());
+}
+
+void __fastcall Complete_Endemic(const char*,
+                                 int argc,
+                                 const char* const* argv,
+                                 const char*,
+                                 MhwRngCompletionSinkFn addCand,
+                                 void* sinkCtx,
+                                 void*) {
+    if (!addCand) return;
+    std::vector<std::string> knownSpecies;
+    {
+        std::lock_guard<std::mutex> lk(g_stateMx);
+        for (const auto& p : g_speciesPolicies) {
+            if (p.animalId != 0U) {
+                knownSpecies.push_back(FormatSpeciesCode(p.animalId, p.animalType));
+            }
+        }
+        for (std::size_t i = 0; i < g_historyCount; ++i) {
+            if (g_history[i].validSpecies && g_history[i].animalId != 0U) {
+                knownSpecies.push_back(FormatSpeciesCode(g_history[i].animalId, kAnyAnimalType));
+                knownSpecies.push_back(FormatSpeciesCode(g_history[i].animalId, g_history[i].animalType));
+            }
+        }
+    }
+
+    if (argc == 0) {
+        static const char* const kTop[] = {
+            "status", "history", "help", "clear", "min", "normal", "max", "exact"
+        };
+        for (const char* t : kTop) addCand(t, sinkCtx);
+        for (const auto& s : knownSpecies) addCand(s.c_str(), sinkCtx);
+        return;
+    }
+    if (argc == 1 && argv && argv[0]) {
+        const std::string a0 = LowerAscii(argv[0]);
+        if (a0 == "clear" || a0 == "off" || a0 == "reset") {
+            for (const auto& s : knownSpecies) addCand(s.c_str(), sinkCtx);
+            return;
+        }
+        const bool isStandaloneGlobal =
+            (a0 == "status" || a0 == "info" || a0 == "history" || a0 == "recent" ||
+             a0 == "help" || a0 == "?" ||
+             a0 == "min" || a0 == "mini" || a0 == "small" ||
+             a0 == "normal" || a0 == "mid" || a0 == "std" ||
+             a0 == "max" || a0 == "giant" || a0 == "large" || a0 == "big" ||
+             a0 == "exact");
+        if (!isStandaloneGlobal) {
+            std::uint32_t aid = 0U, atp = kAnyAnimalType;
+            if (ParseSpeciesSelector(argv[0], aid, atp)) {
+                static const char* const kActions[] = { "min", "normal", "max", "exact", "clear" };
+                for (const char* a : kActions) addCand(a, sinkCtx);
+            }
+        }
+    }
 }
 
 const MhwRngPluginDescriptor kPluginDesc = {
     kMhwRngApiVersion,
     "endemic",
     u8"环境生物尺寸与大小金控制插件",
-    "1.0.0",
-    u8"控制环境生物大小金档位与档内尺寸(覆盖地图刷新与捕获抽签，支持按ec代号分流及精确cm反算)"
+    "1.2.0",
+    u8"控制环境生物大小金档位与档内尺寸(直接展开0x0672FBC包装并支持多语言与精确cm反算)"
 };
 
 } // namespace
@@ -1010,35 +1126,68 @@ MHW_RNG_PLUGIN_EXPORT bool MhwRngPlugin_Init(const MhwRngHostApi* host, MhwRngPl
     g_host   = host;
     g_selfId = selfId;
 
-    host->RegisterSiteMeta(selfId,
-                           kRvaCrownTierRoll,
-                           "endemic.crown",
-                           u8"环境生物大小金档位抽取 (由 endemic 插件托管)",
-                           &FormatEndemicSlotStatus,
-                           nullptr);
-    host->RegisterSiteMeta(selfId,
-                           kRvaFieldIntraTierRoll,
-                           "endemic.field_size",
-                           u8"共享浮点区间随机 (由 endemic 仅过滤环境生物刷新)",
-                           &FormatEndemicSlotStatus,
-                           nullptr);
-    host->RegisterSiteMeta(selfId,
-                           kRvaCaptureIntraTierRoll,
-                           "endemic.cap_size",
-                           u8"环境生物捕获时档内精确尺寸抽取 (由 endemic 插件托管)",
-                           &FormatEndemicSlotStatus,
-                           nullptr);
+    MhwRng_RegisterPluginInfoBi(
+        host, selfId,
+        u8"环境生物尺寸与大小金控制插件",
+        "Endemic Life Size & Crown Controller",
+        u8"控制环境生物大小金档位与精确cm/倍率尺寸",
+        "Endemic life crown tier & exact scale/cm size controller");
 
-    host->RegisterSlotHook(selfId, kRvaCrownTierRoll,        &OnEndemicCrownTierDraw, nullptr);
-    host->RegisterSlotHook(selfId, kRvaFieldIntraTierRoll,   &OnFieldIntraTierDraw,   nullptr);
-    host->RegisterSlotHook(selfId, kRvaCaptureIntraTierRoll, &OnCaptureIntraTierDraw, nullptr);
+    MhwRng_RegisterSiteMetaBi(
+        host, selfId,
+        kRvaCrownTierRoll,
+        "endemic.crown",
+        u8"环境生物大小金档位抽取 (由 endemic 插件托管)",
+        "Endemic life crown tier roll (managed by endemic plugin)",
+        &FormatEndemicSlotStatus,
+        nullptr);
+    MhwRng_RegisterSiteMetaBi(
+        host, selfId,
+        kRvaFieldRangeStd,
+        "endemic.field_size",
+        u8"环境生物地图刷新档内尺寸插值 (经 0x0672FBC 自动展开)",
+        "Endemic field spawn intra-tier size roll (via 0x0672FBC)",
+        &FormatEndemicSlotStatus,
+        nullptr);
+    MhwRng_RegisterSiteMetaBi(
+        host, selfId,
+        kRvaFieldRangeSpec,
+        "endemic.special_size",
+        u8"环境生物特殊区域刷新档内尺寸插值 (经 0x0672FBC 自动展开)",
+        "Endemic special-zone spawn intra-tier size roll (via 0x0672FBC)",
+        &FormatEndemicSlotStatus,
+        nullptr);
+    MhwRng_RegisterSiteMetaBi(
+        host, selfId,
+        kRvaCaptureIntraTierRoll,
+        "endemic.cap_size",
+        u8"环境生物捕获时档内精确尺寸抽取 (由 endemic 插件托管)",
+        "Endemic capture intra-tier exact size roll (managed by endemic)",
+        &FormatEndemicSlotStatus,
+        nullptr);
 
-    host->RegisterSubcommand(selfId,
-                             "endemic",
-                             "$rng endemic [ecXXX[_YY]] <min|normal|max|exact 1.2x|clear>",
-                             u8"环境生物尺寸与大小金控制(覆盖刷新与捕获抽签)",
-                             &Cmd_Endemic,
-                             nullptr);
+    MhwRngHookDesc hCrown{};
+    hCrown.structSize = sizeof(hCrown);
+    hCrown.rva        = kRvaCrownTierRoll;
+    hCrown.priority   = 0;
+    hCrown.flags      = kMhwRngHookPre | kMhwRngHookPost | kMhwRngHookObserveOnly;
+    hCrown.preFn      = &OnEndemicCrownTierDrawPre;
+    hCrown.postFn     = &OnEndemicCrownTierDrawPost;
+    host->RegisterSlotHookEx(selfId, &hCrown);
+
+    host->RegisterSlotHook(selfId, kRvaFieldRangeStd,        &OnFieldStdIntraTierDraw,  nullptr);
+    host->RegisterSlotHook(selfId, kRvaFieldRangeSpec,       &OnFieldSpecIntraTierDraw, nullptr);
+    host->RegisterSlotHook(selfId, kRvaCaptureIntraTierRoll, &OnCaptureIntraTierDraw,   nullptr);
+
+    MhwRng_RegisterSubcommandBi(
+        host, selfId,
+        "endemic",
+        "$rng endemic [ecXXX[_YY]] <min|normal|max|exact 1.2x|clear>",
+        u8"环境生物尺寸与大小金控制(覆盖刷新与捕获抽签)",
+        "Control endemic life crown tier & exact scale/cm on spawn and capture",
+        &Cmd_Endemic,
+        nullptr);
+    MhwRng_RegisterSubcommandCompleter(host, selfId, "endemic", &Complete_Endemic, nullptr);
     return true;
 }
 

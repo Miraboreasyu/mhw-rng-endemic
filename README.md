@@ -1,9 +1,9 @@
 # `rng_endemic` 官方插件技术文档（环境生物尺寸与大小金控制）
 
-- **插件标识**：`endemic`（编译产物 `rng_endemic.dll`，版本 `1.0.0`）
+- **插件标识**：`endemic`（编译产物 `rng_endemic.dll`，版本 `1.1.0`）
 - **源码位置**：[endemic_plugin.cpp](endemic_plugin.cpp)
 - **宿主依赖**：`mhw_rng.dll`（Plugin SDK `kMhwRngApiVersion == 3`，头文件 [mhw_rng_api.h](include/mhw_rng_api.h)）
-- **接管调用点**：`0x166CFE1`（档位抽取）、`0x0672FBC`（地图刷新档内插值，仅过滤环境生物调用来源）、`0x1669CB6`（捕获时档内插值）
+- **接管调用点**：`0x166CFE1`（档位抽取）、`0x1D2A472` / `0x1D2A3CC`（经微内核内置 `0x0672FBC` 透明包装展开后的地图刷新档内插值）、`0x1669CB6`（捕获时档内插值）
 
 本文档说明 `rng_endemic` 插件所依据的原版环境生物尺寸逆向逻辑、共享随机函数的调用栈过滤机制、按物种条件分流方式以及聊天命令参考。
 
