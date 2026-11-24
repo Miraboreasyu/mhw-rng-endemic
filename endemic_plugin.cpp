@@ -40,6 +40,9 @@
 //      `g_host->...`.
 // ============================================================================
 #include "mhw_rng_api.h"
+#include "mhw_rng_math.h"
+#include "mhw_1523_world.h"
+#include "mhw_world_api.h"
 
 #include <windows.h>
 #include <algorithm>
@@ -71,20 +74,23 @@ constexpr std::uintptr_t kRvaCallerFieldWrapHi     = 0x0271960U; // `0x140271840
 constexpr std::uintptr_t kRvaCallerFieldTailRet    = 0x1D2A407U; // `0x141D2A1E0` -> `CALL 0x140271840` (tail-jmp to 0x14166CCC0)
 constexpr std::uintptr_t kRvaCallerGroupRareRet    = 0x0271FFFU; // `0x140271f90` -> `CALL 0x14166d070`
 
-// Verified `rAnimalSize`, `uAnimal`, `sAnimal` & `cAnimalGroupCtrl` offsets:
-constexpr std::uintptr_t kRvaAnimalSizeGlobalPtr   = 0x5012740U;
-constexpr std::uintptr_t kOffUAnimalId             = 0x1AF0U;
-constexpr std::uintptr_t kOffUAnimalType           = 0x1AF4U;
-constexpr std::uintptr_t kOffSAnimalRareSlotBase   = 0x70A8U;
-constexpr std::uintptr_t kRareSlotStride           = 0xD0U;
-constexpr std::uintptr_t kOffRareSlotJustRolled    = 0xCBU;    // `+0x7173` relative to `sAnimal`
-constexpr std::uintptr_t kOffGroupCtrlAnimalId     = 0x328U;
-constexpr std::uintptr_t kOffGroupCtrlAnimalType   = 0x32CU;
-constexpr std::uintptr_t kOffGroupCtrlRegionId     = 0x330U;
+// Verified `rAnimalSize`, `uAnimal`, `sAnimal` & `cAnimalGroupCtrl` offsets (from `mhw_1523_world.h`):
+constexpr std::uintptr_t kRvaAnimalSizeGlobalPtr   = mhw1523::kRvaRAnimalSize;
+constexpr std::uintptr_t kOffUAnimalId             = mhw1523::kOffUAnimalId;
+constexpr std::uintptr_t kOffUAnimalType           = mhw1523::kOffUAnimalType;
+constexpr std::uintptr_t kOffSAnimalRareSlotBase   = mhw1523::kOffSAnimalRareSlotBase;
+constexpr std::uintptr_t kRareSlotStride           = mhw1523::kRareSlotStride;
+constexpr std::uintptr_t kOffRareSlotJustRolled    = mhw1523::kOffRareSlotJustRolled;
+constexpr std::uintptr_t kOffGroupCtrlAnimalId     = mhw1523::kOffGroupCtrlAnimalId;
+constexpr std::uintptr_t kOffGroupCtrlAnimalType   = mhw1523::kOffGroupCtrlAnimalType;
+constexpr std::uintptr_t kOffGroupCtrlRegionId     = mhw1523::kOffGroupCtrlRegionId;
 
-constexpr float          kProbEps                  = 1.192092896e-7f; // `DAT_142e4fe48` (`FLT_EPSILON`)
-constexpr std::uint32_t  kMinSafeFloatU32          = 0x00000001U;
-constexpr std::uint32_t  kMaxSafeFloatU32          = 0xFFFFFF00U;
+constexpr float          kProbEps                  = mhw_sdk::kProbEpsilon;
+using mhw_sdk::kMinSafeFloatU32;
+using mhw_sdk::kMaxSafeFloatU32;
+using mhw_sdk::IsValidUserPtr;
+using mhw_sdk::FractionToTierU32;
+using mhw_sdk::FractionToOpenSafeU32;
 constexpr std::uint32_t  kRareForceU32             = 0x00000001U; // 2^-32: passes any prob > 0 while skipping 0.0f disabled entries
 constexpr std::uint32_t  kRareBlockU32             = 0xFFFFFFFFU; // 1.0f : blocks any prob < 1.0f cleanly
 constexpr std::uint32_t  kAnyAnimalType            = 0xFFFFFFFFU;
@@ -220,6 +226,7 @@ std::vector<RarePolicy>    g_speciesRarePolicies;
 bool                       g_rareLogEnabled   = false;
 RareHistoryEntry           g_rareHistory[kRareHistoryCap]{};
 std::size_t                g_rareHistoryCount = 0U;
+MhwRngHookHandle           g_worldEvHandle    = kMhwRngInvalidHandle;
 
 thread_local ThreadLocalEndemicCtx tls_lastRoll{};
 thread_local RareTlsRollCtx        tls_lastRareRoll{};
@@ -240,9 +247,7 @@ std::string LowerAscii(std::string s) {
     return s;
 }
 
-bool IsValidUserPtr(std::uintptr_t p, std::uintptr_t alignMask = 0x7ULL) noexcept {
-    return p >= 0x100000ULL && p <= 0x00007FFFFFFF0000ULL && (p & alignMask) == 0ULL;
-}
+// `IsValidUserPtr` is imported from `mhw_rng_math.h`.
 
 std::uint32_t MakeSpeciesCondId(std::uint32_t animalId, std::uint32_t animalType) noexcept {
     if (animalId == 0U) return 0U;
@@ -441,22 +446,7 @@ bool ParseSpeciesSelector(const std::string& rawTok,
     return false;
 }
 
-std::uint32_t FractionToTierU32(double frac0To1, bool allowExactOne) noexcept {
-    if (!(frac0To1 > 0.0)) return 0U;
-    if (frac0To1 >= 1.0) return allowExactOne ? 0xFFFFFFFFU : kMaxSafeFloatU32;
-    const auto u = static_cast<std::uint64_t>(frac0To1 * static_cast<double>(kMaxSafeFloatU32) + 0.5);
-    if (u >= kMaxSafeFloatU32) return kMaxSafeFloatU32;
-    return static_cast<std::uint32_t>(u);
-}
-
-std::uint32_t FractionToOpenSafeU32(double frac0To1) noexcept {
-    if (!(frac0To1 > 0.0)) return kMinSafeFloatU32;
-    if (frac0To1 >= 1.0) return kMaxSafeFloatU32;
-    const auto u = static_cast<std::uint64_t>(frac0To1 * static_cast<double>(kMaxSafeFloatU32) + 0.5);
-    if (u <= kMinSafeFloatU32) return kMinSafeFloatU32;
-    if (u >= kMaxSafeFloatU32) return kMaxSafeFloatU32;
-    return static_cast<std::uint32_t>(u);
-}
+// `FractionToTierU32` & `FractionToOpenSafeU32` are imported from `mhw_rng_math.h`.
 
 // ============================================================================
 //  SEH-Safe Live Reading of `rAnimalSize` (`0x145012740`) & Stack Context
@@ -1234,6 +1224,16 @@ void HandleSimpleRarePost(const MhwRngDrawContext* ctx, std::uint8_t expectedKin
     tls_lastRareRoll = RareTlsRollCtx{};
     if (emitLog) {
         EmitRareLogAsync(entry);
+        if (spawned && entry.overridden && entry.validSp) {
+            const bool en = IsEn();
+            const std::string sp = FormatSpeciesCode(entry.animalId, entry.animalType);
+            char popupBuf[192]{};
+            std::snprintf(popupBuf, sizeof(popupBuf),
+                          en ? "[endemic/rare] Rare spawn active: %s"
+                             : u8"[环境生物/稀有] 已触发稀有出现: %s",
+                          sp.c_str());
+            MhwWorld_TryDisplayPopup(g_host, popupBuf, 3.0f, 0.0f, 0U);
+        }
     }
 }
 
@@ -1377,6 +1377,16 @@ void __fastcall OnRareMutexDrawPost(const MhwRngDrawContext* ctx, MhwRngHookDeci
     tls_lastRareMutex = RareMutexTlsCtx{};
     if (emitLog) {
         EmitRareLogAsync(entry);
+        if (entry.spawned && entry.overridden && entry.validSp) {
+            const bool en = IsEn();
+            const std::string sp = FormatSpeciesCode(entry.animalId, entry.animalType);
+            char popupBuf[192]{};
+            std::snprintf(popupBuf, sizeof(popupBuf),
+                          en ? "[endemic/rare] Rare spawn active: %s"
+                             : u8"[环境生物/稀有] 已触发稀有出现: %s",
+                          sp.c_str());
+            MhwWorld_TryDisplayPopup(g_host, popupBuf, 3.0f, 0.0f, 0U);
+        }
     }
 }
 
@@ -1615,6 +1625,24 @@ void PrintRareStatus() {
     if (spRare.size() > showN) {
         g_host->ChatPrintf(en ? "[endemic/rare] ...and %zu more rare rule(s)" : u8"[endemic/rare] ...另有 %zu 条稀有专属规则",
                            spRare.size() - showN);
+    }
+    MhwWorldState ws{};
+    if (MhwWorld_TryGetState(g_host, &ws) && ws.inScene != 0U) {
+        const char* wxStr = ws.hasTime
+                                ? (ws.isSpecialWeather ? (en ? "Special" : u8"特殊天气") : (en ? "Clear" : u8"常规"))
+                                : "?";
+        if (ws.isGuidingLands != 0U) {
+            g_host->ChatPrintf(en ? "[endemic/rare] Live World: Stage %u | Hour %.1f | Weather %u (%s) | GL Lv %u/%u/%u/%u/%u/%u"
+                                  : u8"[endemic/rare] 当前世界: 地图 %u | 时间 %.1fh | 天气 %u (%s) | 聚魔 %u/%u/%u/%u/%u/%u",
+                               ws.stageId, static_cast<double>(ws.gameHour), ws.weatherId, wxStr,
+                               static_cast<unsigned>(ws.glRegionLevels[0]), static_cast<unsigned>(ws.glRegionLevels[1]),
+                               static_cast<unsigned>(ws.glRegionLevels[2]), static_cast<unsigned>(ws.glRegionLevels[3]),
+                               static_cast<unsigned>(ws.glRegionLevels[4]), static_cast<unsigned>(ws.glRegionLevels[5]));
+        } else {
+            g_host->ChatPrintf(en ? "[endemic/rare] Live World: Stage %u | Hour %.1f | Weather %u (%s)"
+                                  : u8"[endemic/rare] 当前世界: 地图 %u | 时间 %.1fh | 天气 %u (%s)",
+                               ws.stageId, static_cast<double>(ws.gameHour), ws.weatherId, wxStr);
+        }
     }
     PrintRareHistory(false);
 }
@@ -2256,18 +2284,71 @@ MHW_RNG_PLUGIN_EXPORT bool MhwRngPlugin_Init(const MhwRngHostApi* host, MhwRngPl
         &Cmd_Endemic,
         nullptr);
     MhwRng_RegisterSubcommandCompleter(host, selfId, "endemic", &Complete_Endemic, nullptr);
+    g_worldEvHandle = MhwRng_HostSubscribeEvent(
+        host, selfId, "mhw.world.*",
+        [](const MhwRngCustomEvent* ev, void*) {
+            if (!ev || !ev->topic) return;
+            if (std::strcmp(ev->topic, kMhwWorldEvTitleReturn) == 0) {
+                std::lock_guard<std::mutex> lk(g_stateMx);
+                g_historyCount     = 0U;
+                g_rareHistoryCount = 0U;
+                return;
+            }
+            if (std::strcmp(ev->topic, kMhwWorldEvHourChanged) == 0 ||
+                std::strcmp(ev->topic, kMhwWorldEvWeatherChanged) == 0) {
+                bool                 logOn    = false;
+                const MhwRngHostApi* hostCopy = nullptr;
+                {
+                    std::lock_guard<std::mutex> lk(g_stateMx);
+                    logOn    = g_rareLogEnabled;
+                    hostCopy = g_host;
+                }
+                if (logOn && hostCopy && ev->payload && ev->payloadSize >= sizeof(MhwWorldEventPayload)) {
+                    const auto* wp = static_cast<const MhwWorldEventPayload*>(ev->payload);
+                    const bool  en = MhwRng_HostIsEnglish(hostCopy);
+                    if (std::strcmp(ev->topic, kMhwWorldEvHourChanged) == 0) {
+                        if (hostCopy->ChatPrintfAsync) {
+                            hostCopy->ChatPrintfAsync(
+                                en ? "[endemic/rare] World hour -> %02dh (hourly rare checks active)"
+                                   : u8"[endemic/rare] 世界时间切换 -> %02dh (整点稀有生物判定)",
+                                wp->curr.gameHourInt);
+                        }
+                    } else {
+                        if (hostCopy->ChatPrintfAsync) {
+                            hostCopy->ChatPrintfAsync(
+                                en ? "[endemic/rare] Weather -> id=%u (%s)"
+                                   : u8"[endemic/rare] 天气变化 -> id=%u (%s)",
+                                wp->curr.weatherId,
+                                wp->curr.isSpecialWeather ? (en ? "Special" : u8"特殊天气")
+                                                          : (en ? "Clear" : u8"常规"));
+                        }
+                    }
+                }
+            }
+        },
+        nullptr);
     return true;
 }
 
 MHW_RNG_PLUGIN_EXPORT void MhwRngPlugin_Shutdown() {
-    std::lock_guard<std::mutex> lk(g_stateMx);
-    g_globalPolicy     = EndemicPolicy{};
-    g_speciesPolicies.clear();
-    g_historyCount     = 0U;
-    g_globalRarePolicy = RarePolicy{};
-    g_speciesRarePolicies.clear();
-    g_rareLogEnabled   = false;
-    g_rareHistoryCount = 0U;
-    g_host             = nullptr;
-    g_selfId           = 0U;
+    const MhwRngHostApi* hostCopy = nullptr;
+    MhwRngPluginId       selfCopy = 0U;
+    MhwRngHookHandle     evCopy   = kMhwRngInvalidHandle;
+    {
+        std::lock_guard<std::mutex> lk(g_stateMx);
+        hostCopy           = g_host;
+        selfCopy           = g_selfId;
+        evCopy             = g_worldEvHandle;
+        g_worldEvHandle    = kMhwRngInvalidHandle;
+        g_globalPolicy     = EndemicPolicy{};
+        g_speciesPolicies.clear();
+        g_historyCount     = 0U;
+        g_globalRarePolicy = RarePolicy{};
+        g_speciesRarePolicies.clear();
+        g_rareLogEnabled   = false;
+        g_rareHistoryCount = 0U;
+        g_host             = nullptr;
+        g_selfId           = 0U;
+    }
+    MhwRng_HostUnsubscribeEvent(hostCopy, selfCopy, evCopy);
 }
