@@ -1,7 +1,8 @@
 // ============================================================================
-//  MHW RNG Official Plugin: Endemic Life Size & Crown Controller (`rng_endemic.dll`)
-//  Version : 1.1.0 (SDK v3.1)
+//  MHW RNG Official Plugin: Endemic Life Size, Crown & Rare Controller (`rng_endemic.dll`)
+//  Version : 1.3.0 (SDK v3.4)
 //  Targets :
+//    [Size & Crown]
 //    1. `RVA 0x166CFE1` (`FUN_14166ccc0` @ 0x14166CCC0)
 //       Crown Tier Roll (`0 = Mini Crown`, `1 = Normal`, `2 = Giant Crown`),
 //       shared by both field spawns (`0x141D2A1E0 -> 0x140271840`) and
@@ -13,9 +14,22 @@
 //    3. `RVA 0x1669CB6` (`0x141669AC0`)
 //       Capture-time intra-tier linear size interpolation for species whose
 //       size is determined on capture (`sizeMode == 3`).
+//    [Rare Endemic Life / Great-Size Fish / Guiding Lands Moly Spawn (Pure-RNG)]
+//    4. `RVA 0x1A4ACED` (`FUN_141a4a9b0` @ 0x141A4A9B0)
+//       Master rare endemic, rare fish, extra Great-Size fish & Guiding Lands
+//       Moly burrow activation roll (on map load init and each in-game hour).
+//    5. `RVA 0x0271F25` (`0x140271ce0` @ 0x140271CE0)
+//       Guiding Lands Rare Regional Moly (`state = 7`) vs Normal (`state = 8`).
+//    6. `RVA 0x166D12E` (`FUN_14166d070` @ 0x14166D070, caller `0x140271f90`)
+//       Group-level rare availability flag (`cAnimalGroupCtrl + 0x334`).
+//    7. `RVA 0x1A44FCC` (`FUN_141a44f50` @ 0x141A44F50)
+//       Mutually-exclusive rare spawn group tie-breaker (protects forced rare
+//       slots from being wiped by inactive group siblings).
 //
 //  Architecture & SDK Best-Practice Highlights:
-//    - Zero extra game hooks: operates purely via microkernel `RegisterSlotHookEx`.
+//    - Zero extra game hooks / code patches: operates purely via `RegisterSlotHookEx`.
+//    - Respects vanilla weather, time-of-day & Guiding Lands region-level gates
+//      while letting enabled rare species roll at 100% (or 0% blocked) cleanly.
 //    - Reads live `SizeSetData::mSizeProbability[3]` + active Felyne food /
 //      Bounty bonuses from `0x14166CCC0`'s stack frame, computing exact legal
 //      midpoints so disabled 0-probability crown tiers are skipped cleanly and
@@ -45,22 +59,36 @@ constexpr std::uint32_t  kRvaCrownTierRoll         = 0x166CFE1U; // `FUN_14166cc
 constexpr std::uint32_t  kRvaFieldRangeStd         = 0x1D2A472U; // `0x141D2A1E0` -> `CALL 0x140672f90` (unwrapped via 0x0672FBC)
 constexpr std::uint32_t  kRvaFieldRangeSpec        = 0x1D2A3CCU; // `0x141D2A1E0` -> `CALL 0x140672f90` (special region spawn)
 constexpr std::uint32_t  kRvaCaptureIntraTierRoll  = 0x1669CB6U; // `0x141669AC0` `CALL MtRandom::nrand`
+constexpr std::uint32_t  kRvaRareMasterRoll        = 0x1A4ACEDU; // `FUN_141a4a9b0` `CALL MtRandom::nrand`
+constexpr std::uint32_t  kRvaRareMolyRoll          = 0x0271F25U; // `0x140271ce0` `CALL MtRandom::nrand`
+constexpr std::uint32_t  kRvaRareGroupRoll         = 0x166D12EU; // `FUN_14166d070` `CALL MtRandom::nrand`
+constexpr std::uint32_t  kRvaRareMutexTieBreak     = 0x1A44FCCU; // `FUN_141a44f50` `CALL MtRandom::nrand`
 
-// Verified caller return RVAs for stack-frame validation in `FUN_14166ccc0`:
+// Verified caller return RVAs for stack-frame validation:
 constexpr std::uintptr_t kRvaCallerCaptureRollRet  = 0x1669C19U; // `0x141669AC0` -> `CALL 0x14166ccc0`
 constexpr std::uintptr_t kRvaCallerFieldWrapLo     = 0x0271840U; // `0x140271840` (`nAnimal::SizeSetData::ctor`) start
 constexpr std::uintptr_t kRvaCallerFieldWrapHi     = 0x0271960U; // `0x140271840` end
 constexpr std::uintptr_t kRvaCallerFieldTailRet    = 0x1D2A407U; // `0x141D2A1E0` -> `CALL 0x140271840` (tail-jmp to 0x14166CCC0)
+constexpr std::uintptr_t kRvaCallerGroupRareRet    = 0x0271FFFU; // `0x140271f90` -> `CALL 0x14166d070`
 
-// Verified `rAnimalSize` (`DAT_145012740`) & `uAnimal` offsets:
+// Verified `rAnimalSize`, `uAnimal`, `sAnimal` & `cAnimalGroupCtrl` offsets:
 constexpr std::uintptr_t kRvaAnimalSizeGlobalPtr   = 0x5012740U;
 constexpr std::uintptr_t kOffUAnimalId             = 0x1AF0U;
 constexpr std::uintptr_t kOffUAnimalType           = 0x1AF4U;
+constexpr std::uintptr_t kOffSAnimalRareSlotBase   = 0x70A8U;
+constexpr std::uintptr_t kRareSlotStride           = 0xD0U;
+constexpr std::uintptr_t kOffRareSlotJustRolled    = 0xCBU;    // `+0x7173` relative to `sAnimal`
+constexpr std::uintptr_t kOffGroupCtrlAnimalId     = 0x328U;
+constexpr std::uintptr_t kOffGroupCtrlAnimalType   = 0x32CU;
+constexpr std::uintptr_t kOffGroupCtrlRegionId     = 0x330U;
 
 constexpr float          kProbEps                  = 1.192092896e-7f; // `DAT_142e4fe48` (`FLT_EPSILON`)
 constexpr std::uint32_t  kMinSafeFloatU32          = 0x00000001U;
 constexpr std::uint32_t  kMaxSafeFloatU32          = 0xFFFFFF00U;
+constexpr std::uint32_t  kRareForceU32             = 0x00000001U; // 2^-32: passes any prob > 0 while skipping 0.0f disabled entries
+constexpr std::uint32_t  kRareBlockU32             = 0xFFFFFFFFU; // 1.0f : blocks any prob < 1.0f cleanly
 constexpr std::uint32_t  kAnyAnimalType            = 0xFFFFFFFFU;
+constexpr std::uint32_t  kMaxRareMutexSlots        = 128U;
 
 enum class PolicyMode : std::uint8_t {
     kNone       = 0, // Unmodified (MasterDerived / kernel default)
@@ -118,7 +146,64 @@ struct ThreadLocalEndemicCtx {
     AnimalSizeRow sizeRow{};
 };
 
-constexpr std::size_t kHistoryCap = 6U;
+enum class RareMode : std::uint8_t {
+    kVanilla  = 0,
+    kForceOn  = 1,
+    kForceOff = 2
+};
+
+struct RarePolicy {
+    RareMode      mode       = RareMode::kVanilla;
+    std::uint32_t animalId   = 0U;
+    std::uint32_t animalType = kAnyAnimalType;
+    std::uint32_t condId     = 0U;
+};
+
+struct RareHistoryEntry {
+    std::uint8_t  siteKind    = 0U; // 0=master, 1=moly, 2=group, 3=mutex
+    bool          validSp     = false;
+    bool          spawned     = false;
+    bool          overridden  = false;
+    bool          isInit      = true;
+    std::uint32_t animalId    = 0U;
+    std::uint32_t animalType  = 0U;
+    std::int32_t  extra       = 0;  // master/group: targetWeather; moly: regionIdx; mutex: winSlotPos
+    float         effProb     = -1.0f;
+    std::uint8_t  startHour   = 0U;
+    std::uint8_t  endHour     = 24U;
+};
+
+struct RareTlsRollCtx {
+    bool          valid      = false;
+    bool          overridden = false;
+    bool          isInit     = true;
+    std::uint8_t  siteKind   = 0U;
+    std::uint32_t animalId   = 0U;
+    std::uint32_t animalType = 0U;
+    std::int32_t  extra      = 0;
+    float         effProb    = -1.0f;
+    std::uint8_t  startHour  = 0U;
+    std::uint8_t  endHour    = 24U;
+};
+
+struct RareMutexCand {
+    std::uint32_t k          = 0U;
+    bool          validSp    = false;
+    std::uint32_t animalId   = 0U;
+    std::uint32_t animalType = 0U;
+};
+
+struct RareMutexTlsCtx {
+    bool          valid      = false;
+    bool          overridden = false;
+    std::uint32_t groupCount = 0U;
+    std::uint32_t winnerK    = 0U;
+    std::size_t   candCount  = 0U;
+    RareMutexCand cands[kMaxRareMutexSlots]{};
+};
+
+constexpr std::size_t kHistoryCap     = 6U;
+constexpr std::size_t kRareHistoryCap = 12U;
 
 const MhwRngHostApi*       g_host   = nullptr;
 MhwRngPluginId             g_selfId = 0U;
@@ -130,7 +215,15 @@ std::vector<EndemicPolicy> g_speciesPolicies;
 EndemicHistoryEntry        g_history[kHistoryCap]{};
 std::size_t                g_historyCount = 0U;
 
+RarePolicy                 g_globalRarePolicy{};
+std::vector<RarePolicy>    g_speciesRarePolicies;
+bool                       g_rareLogEnabled   = false;
+RareHistoryEntry           g_rareHistory[kRareHistoryCap]{};
+std::size_t                g_rareHistoryCount = 0U;
+
 thread_local ThreadLocalEndemicCtx tls_lastRoll{};
+thread_local RareTlsRollCtx        tls_lastRareRoll{};
+thread_local RareMutexTlsCtx       tls_lastRareMutex{};
 
 inline bool IsEn() noexcept {
     return MhwRng_HostIsEnglish(g_host);
@@ -159,7 +252,7 @@ std::uint32_t MakeSpeciesCondId(std::uint32_t animalId, std::uint32_t animalType
     return (animalId << 8) | (animalType & 0x7FU);
 }
 
-std::string FormatSpeciesCode(std::uint32_t animalId, std::uint32_t animalType) {
+std::string FormatSpeciesCodeRaw(std::uint32_t animalId, std::uint32_t animalType) {
     char buf[32]{};
     if (animalType == kAnyAnimalType) {
         std::snprintf(buf, sizeof(buf), "ec%03u*", animalId);
@@ -167,6 +260,65 @@ std::string FormatSpeciesCode(std::uint32_t animalId, std::uint32_t animalType) 
         std::snprintf(buf, sizeof(buf), "ec%03u_%02u", animalId, animalType);
     }
     return buf;
+}
+
+// ----------------------------------------------------------------------------
+//  Endemic life name table (Simplified Chinese / English), auto-generated from
+//  the game's own research-note + item text data (see `endemic_names.inl`).
+// ----------------------------------------------------------------------------
+struct EndemicNameEntry {
+    std::uint16_t animalId;
+    std::uint16_t animalType;
+    std::uint8_t  isRare;   // 1 = research-note rare flag, 0 = common, 2 = gimmick creature
+    std::uint8_t  hasGreat; // 1 = fish with a separate Great-size item
+    const char*   zh;
+    const char*   en;
+    const char*   slug;
+};
+
+#define ENDEMIC_NAME(id, tp, rare, great, zh, en, sl) \
+    { static_cast<std::uint16_t>(id), static_cast<std::uint16_t>(tp), \
+      static_cast<std::uint8_t>(rare), static_cast<std::uint8_t>(great), zh, en, sl },
+const EndemicNameEntry kEndemicNames[] = {
+#include "endemic_names.inl"
+};
+#undef ENDEMIC_NAME
+
+const EndemicNameEntry* FindEndemicName(std::uint32_t animalId, std::uint32_t animalType) noexcept {
+    for (const auto& e : kEndemicNames) {
+        if (e.animalId == animalId && e.animalType == animalType) return &e;
+    }
+    return nullptr;
+}
+
+std::size_t CountEndemicVariants(std::uint32_t animalId) noexcept {
+    std::size_t n = 0U;
+    for (const auto& e : kEndemicNames) {
+        if (e.animalId == animalId) ++n;
+    }
+    return n;
+}
+
+// Human-readable label, e.g. `ec058_00(月羽天母)` / `ec059*(Moly, all variants)`.
+std::string FormatSpeciesCode(std::uint32_t animalId, std::uint32_t animalType) {
+    std::string code = FormatSpeciesCodeRaw(animalId, animalType);
+    const bool en = IsEn();
+    if (animalType == kAnyAnimalType) {
+        const EndemicNameEntry* base = FindEndemicName(animalId, 0U);
+        if (!base) return code;
+        const bool multi = CountEndemicVariants(animalId) > 1U;
+        code += "(";
+        code += en ? base->en : base->zh;
+        if (multi) code += en ? ", all variants" : u8" 全变种";
+        code += ")";
+        return code;
+    }
+    const EndemicNameEntry* e = FindEndemicName(animalId, animalType);
+    if (!e) return code;
+    code += "(";
+    code += en ? e->en : e->zh;
+    code += ")";
+    return code;
 }
 
 const char* TierName(std::uint32_t tier, bool en) noexcept {
@@ -198,14 +350,59 @@ std::string FormatPolicySummary(const EndemicPolicy& p, bool en) {
     }
 }
 
+const char* FormatRareModeSummary(RareMode m, bool en) noexcept {
+    switch (m) {
+        case RareMode::kForceOn:  return en ? "Force 100% (Pure-RNG)" : u8"强制必刷(100% 纯RNG)";
+        case RareMode::kForceOff: return en ? "Blocked (0%)"          : u8"屏蔽刷新(0%)";
+        default:                  return en ? "Vanilla (unlocked)"    : u8"未锁定(正常随机)";
+    }
+}
+
+const char* RareSiteTag(std::uint8_t siteKind, bool en) noexcept {
+    switch (siteKind) {
+        case 1U: return en ? "Moly"  : u8"地区稀有毛吉";
+        case 2U: return en ? "Group" : u8"族群稀有";
+        case 3U: return en ? "Mutex" : u8"互斥保底";
+        default: return en ? "Rare"  : u8"稀有生成";
+    }
+}
+
+const char* WeatherGateTag(std::int32_t weatherGate, bool en) noexcept {
+    switch (weatherGate) {
+        case 1:  return en ? "Clear"   : u8"晴天";
+        case 2:  return en ? "Special" : u8"特殊天气";
+        default: return en ? "Any"     : u8"不限天气";
+    }
+}
+
 // Parses species selectors:
 //   - `ec059` / `ec59` / `#59`           -> (animalId=59, animalType=kAnyAnimalType)
 //   - `ec059_02` / `ec59_2` / `59:2`     -> (animalId=59, animalType=2)
+//   - `掘土毛吉` / `rocky_moly`           -> exact variant from the game-data name table
+//   - `毛吉*` / `moly*`                   -> whole family of that variant's animalId
 bool ParseSpeciesSelector(const std::string& rawTok,
                           std::uint32_t& outAnimalId,
                           std::uint32_t& outAnimalType) {
     if (rawTok.empty()) return false;
     const std::string low = LowerAscii(rawTok);
+
+    {
+        std::string nameTok = rawTok;
+        std::string nameLow = low;
+        bool family = false;
+        if (nameTok.size() > 1U && nameTok.back() == '*') {
+            family = true;
+            nameTok.pop_back();
+            nameLow.pop_back();
+        }
+        for (const auto& e : kEndemicNames) {
+            if (nameTok == e.zh || nameLow == e.slug) {
+                outAnimalId   = e.animalId;
+                outAnimalType = family ? kAnyAnimalType : e.animalType;
+                return true;
+            }
+        }
+    }
 
     const char* s = low.c_str();
     if (low.rfind("ec", 0) == 0 && low.size() >= 3U) {
@@ -466,24 +663,56 @@ std::uint32_t SimulateCrownTier(const LiveCrownTierContext& sc, std::uint32_t u3
 }
 
 // Finds active policy under `g_stateMx` (exact `ecXXX_YY` > wildcard `ecXXX*` > global).
-const EndemicPolicy* FindActivePolicyLocked(bool validSpecies,
-                                            std::uint32_t animalId,
-                                            std::uint32_t animalType) noexcept {
+template <typename PolicyT, typename Pred>
+const PolicyT* FindActiveRuleLocked(const PolicyT& globalPol,
+                                    const std::vector<PolicyT>& spList,
+                                    bool validSpecies,
+                                    std::uint32_t animalId,
+                                    std::uint32_t animalType,
+                                    Pred isActive,
+                                    bool* outIsSpeciesRule = nullptr) noexcept {
+    if (outIsSpeciesRule) *outIsSpeciesRule = false;
     if (validSpecies) {
-        // 1. Exact `(animalId, animalType)` match
-        for (const auto& p : g_speciesPolicies) {
-            if (p.mode != PolicyMode::kNone && p.animalId == animalId && p.animalType == animalType) {
+        for (const auto& p : spList) {
+            if (isActive(p) && p.animalId == animalId && p.animalType == animalType) {
+                if (outIsSpeciesRule) *outIsSpeciesRule = true;
                 return &p;
             }
         }
-        // 2. Family `(animalId, *)` match
-        for (const auto& p : g_speciesPolicies) {
-            if (p.mode != PolicyMode::kNone && p.animalId == animalId && p.animalType == kAnyAnimalType) {
+        for (const auto& p : spList) {
+            if (isActive(p) && p.animalId == animalId && p.animalType == kAnyAnimalType) {
+                if (outIsSpeciesRule) *outIsSpeciesRule = true;
                 return &p;
             }
         }
     }
-    return &g_globalPolicy;
+    return &globalPol;
+}
+
+const EndemicPolicy* FindActivePolicyLocked(bool validSpecies,
+                                            std::uint32_t animalId,
+                                            std::uint32_t animalType) noexcept {
+    return FindActiveRuleLocked(
+        g_globalPolicy, g_speciesPolicies, validSpecies, animalId, animalType,
+        [](const EndemicPolicy& p) noexcept { return p.mode != PolicyMode::kNone; });
+}
+
+const RarePolicy* FindActiveRarePolicyLocked(bool validSpecies,
+                                             std::uint32_t animalId,
+                                             std::uint32_t animalType,
+                                             bool* outIsSpeciesRule = nullptr) noexcept {
+    return FindActiveRuleLocked(
+        g_globalRarePolicy, g_speciesRarePolicies, validSpecies, animalId, animalType,
+        [](const RarePolicy& p) noexcept { return p.mode != RareMode::kVanilla; },
+        outIsSpeciesRule);
+}
+
+bool HasAnyRareForceOnLocked() noexcept {
+    if (g_globalRarePolicy.mode == RareMode::kForceOn) return true;
+    for (const auto& p : g_speciesRarePolicies) {
+        if (p.mode == RareMode::kForceOn) return true;
+    }
+    return false;
 }
 
 std::uint32_t ComputeIntraTierU32(const EndemicPolicy& pol, std::uint32_t tier) noexcept {
@@ -729,6 +958,460 @@ bool __fastcall FormatEndemicSlotStatus(const MhwRngSlotSnapshot* snap,
 }
 
 // ============================================================================
+//  SEH-Safe Context Readers & Hooks for Rare Endemic / Moly / Mutex Sites
+// ============================================================================
+
+void FillRareSetDataFieldsSEH(std::uintptr_t rareSetPtr,
+                              RareTlsRollCtx& out,
+                              bool copyProbIfMissing) noexcept {
+    if (!IsValidUserPtr(rareSetPtr, 0x3ULL)) return;
+    out.extra     = *reinterpret_cast<const std::int32_t*>(rareSetPtr + 0x08U); // mTargetWeather
+    out.startHour = *reinterpret_cast<const std::uint8_t*>(rareSetPtr + 0x10U);
+    out.endHour   = *reinterpret_cast<const std::uint8_t*>(rareSetPtr + 0x11U);
+    if (copyProbIfMissing || out.effProb < 0.0f || !std::isfinite(out.effProb)) {
+        const float bp = *reinterpret_cast<const float*>(rareSetPtr + 0x0CU);
+        if (std::isfinite(bp) && bp >= 0.0f && bp <= 10.0f) out.effProb = bp;
+    }
+}
+
+// 1. `FUN_141a4a9b0` (`RVA 0x1A4ACED`):
+//    `R14D` = animalId, `EBX` = animalType, `R15` = RareSetData*, `XMM6` = effectiveProb,
+//    `*(returnAddrSlot + 0xE0)` = isInit (`1` = map load init, `0` = hourly tick).
+bool ReadRareMasterCtxSEH(const MhwRngDrawContext* ctx, RareTlsRollCtx& out) noexcept {
+    out = RareTlsRollCtx{};
+    out.siteKind = 0U;
+    if (!ctx || !ctx->callerRegs) return false;
+    __try {
+        const auto aid = static_cast<std::uint32_t>(ctx->callerRegs->r14);
+        const auto atp = static_cast<std::uint32_t>(ctx->callerRegs->rbx);
+        out.valid      = (aid > 0U && aid < 1000U && atp < 256U);
+        out.animalId   = aid;
+        out.animalType = atp;
+        if (ctx->returnAddrSlot) {
+            const auto* bytes = reinterpret_cast<const std::uint8_t*>(ctx->returnAddrSlot);
+            out.isInit = (bytes[0xE0U] != 0U);
+        }
+        if ((ctx->callFlags & kMhwRngDrawFlagHasXmmRegs) != 0U) {
+            const float xp = ctx->callerRegs->xmm6.f32[0];
+            if (std::isfinite(xp) && xp >= 0.0f && xp <= 10.0f) out.effProb = xp;
+        }
+        FillRareSetDataFieldsSEH(static_cast<std::uintptr_t>(ctx->callerRegs->r15), out, out.effProb < 0.0f);
+        return out.valid;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// 2. `0x140271ce0` (`RVA 0x0271F25`):
+//    `R15` = cAnimalGroupCtrlEc059* (`+0x328` id, `+0x32C` type, `+0x330` regionIdx),
+//    `R12` = Ec059RareSetData*, `XMM6` = mProbability.
+bool ReadRareMolyCtxSEH(const MhwRngDrawContext* ctx, RareTlsRollCtx& out) noexcept {
+    out = RareTlsRollCtx{};
+    out.siteKind = 1U;
+    out.animalId = 59U;
+    if (!ctx || !ctx->callerRegs) return false;
+    __try {
+        const auto ctrlPtr = static_cast<std::uintptr_t>(ctx->callerRegs->r15);
+        if (IsValidUserPtr(ctrlPtr, 0x3ULL)) {
+            const auto aid = *reinterpret_cast<const std::uint32_t*>(ctrlPtr + kOffGroupCtrlAnimalId);
+            const auto atp = *reinterpret_cast<const std::uint32_t*>(ctrlPtr + kOffGroupCtrlAnimalType);
+            const auto reg = *reinterpret_cast<const std::int32_t*>(ctrlPtr + kOffGroupCtrlRegionId);
+            if (aid > 0U && aid < 1000U && atp < 256U) {
+                out.animalId   = aid;
+                out.animalType = atp;
+                out.valid      = true;
+            } else if (atp < 256U) {
+                out.animalId   = 59U;
+                out.animalType = atp;
+                out.valid      = true;
+            }
+            out.extra = reg;
+        }
+        if ((ctx->callFlags & kMhwRngDrawFlagHasXmmRegs) != 0U) {
+            const float xp = ctx->callerRegs->xmm6.f32[0];
+            if (std::isfinite(xp) && xp >= 0.0f && xp <= 10.0f) out.effProb = xp;
+        }
+        const auto rareSetPtr = static_cast<std::uintptr_t>(ctx->callerRegs->r12);
+        if (IsValidUserPtr(rareSetPtr, 0x3ULL)) {
+            out.startHour = *reinterpret_cast<const std::uint8_t*>(rareSetPtr + 0x10U);
+            out.endHour   = *reinterpret_cast<const std::uint8_t*>(rareSetPtr + 0x11U);
+            if (out.effProb < 0.0f) {
+                const float bp = *reinterpret_cast<const float*>(rareSetPtr + 0x0CU);
+                if (std::isfinite(bp) && bp >= 0.0f && bp <= 10.0f) out.effProb = bp;
+            }
+        }
+        return out.valid;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// 3. `FUN_14166d070` (`RVA 0x166D12E`, caller `0x140271f90` @ `0x0271FFF`):
+//    `slotPtr[12]` = return RVA `0x0271FFF`, `slotPtr[13]` = saved `RBX` (`cAnimalGroupCtrl*`),
+//    `RDI` = RareSetData*, `XMM6` = mProbability.
+bool ReadRareGroupCtxSEH(const MhwRngDrawContext* ctx, RareTlsRollCtx& out) noexcept {
+    out = RareTlsRollCtx{};
+    out.siteKind = 2U;
+    if (!ctx || !ctx->returnAddrSlot || !ctx->exeBase) return false;
+    __try {
+        const auto* slotPtr = static_cast<const std::uintptr_t*>(ctx->returnAddrSlot);
+        if (slotPtr[12] != (ctx->exeBase + kRvaCallerGroupRareRet)) return false;
+
+        const std::uintptr_t ctrlPtr = slotPtr[13];
+        if (IsValidUserPtr(ctrlPtr, 0x3ULL)) {
+            const auto aid = *reinterpret_cast<const std::uint32_t*>(ctrlPtr + kOffGroupCtrlAnimalId);
+            const auto atp = *reinterpret_cast<const std::uint32_t*>(ctrlPtr + kOffGroupCtrlAnimalType);
+            if (aid > 0U && aid < 1000U && atp < 256U) {
+                out.animalId   = aid;
+                out.animalType = atp;
+                out.valid      = true;
+            }
+        }
+        if (ctx->callerRegs) {
+            if ((ctx->callFlags & kMhwRngDrawFlagHasXmmRegs) != 0U) {
+                const float xp = ctx->callerRegs->xmm6.f32[0];
+                if (std::isfinite(xp) && xp >= 0.0f && xp <= 10.0f) out.effProb = xp;
+            }
+            FillRareSetDataFieldsSEH(static_cast<std::uintptr_t>(ctx->callerRegs->rdi), out, out.effProb < 0.0f);
+        }
+        return out.valid;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// 4. `FUN_141a44f50` (`RVA 0x1A44FCC`):
+//    `RDI` = `{ uint32_t* slotIdxList, uintptr_t sAnimal, ... }`, `ESI` = `groupCount`.
+bool ScanRareMutexGroupSEH(const MhwRngDrawContext* ctx,
+                           RareMutexCand* outCands,
+                           std::size_t maxCands,
+                           std::size_t& outCandCount,
+                           std::uint32_t& outGroupCount) noexcept {
+    outCandCount  = 0U;
+    outGroupCount = 0U;
+    if (!ctx || !ctx->callerRegs || !outCands || maxCands == 0U) return false;
+    __try {
+        const auto paramPtr = static_cast<std::uintptr_t>(ctx->callerRegs->rdi);
+        const auto groupCnt = static_cast<std::uint32_t>(ctx->callerRegs->rsi);
+        if (!IsValidUserPtr(paramPtr) || groupCnt == 0U || groupCnt > kMaxRareMutexSlots) {
+            return false;
+        }
+        const std::uintptr_t listPtr = *reinterpret_cast<const std::uintptr_t*>(paramPtr + 0x00U);
+        const std::uintptr_t sAnimal = *reinterpret_cast<const std::uintptr_t*>(paramPtr + 0x08U);
+        if (!IsValidUserPtr(listPtr, 0x3ULL) || !IsValidUserPtr(sAnimal)) {
+            return false;
+        }
+
+        outGroupCount = groupCnt;
+        const auto* slotList = reinterpret_cast<const std::uint32_t*>(listPtr);
+        for (std::uint32_t k = 0U; k < groupCnt; ++k) {
+            const std::uint32_t slotIdx = slotList[k];
+            if (slotIdx >= kMaxRareMutexSlots) continue;
+            const std::uintptr_t slotBase =
+                sAnimal + kOffSAnimalRareSlotBase + static_cast<std::uintptr_t>(slotIdx) * kRareSlotStride;
+            const std::uint8_t justRolled = *reinterpret_cast<const std::uint8_t*>(slotBase + kOffRareSlotJustRolled);
+            if (justRolled == 0U) continue;
+
+            RareMutexCand cand{};
+            cand.k = k;
+            for (std::uint32_t j = 0U; j < 8U; ++j) {
+                const std::uintptr_t uAnimal =
+                    *reinterpret_cast<const std::uintptr_t*>(slotBase + static_cast<std::uintptr_t>(j) * 0x18U);
+                if (!IsValidUserPtr(uAnimal)) continue;
+                const auto aid = *reinterpret_cast<const std::uint32_t*>(uAnimal + kOffUAnimalId);
+                const auto atp = *reinterpret_cast<const std::uint32_t*>(uAnimal + kOffUAnimalType);
+                if (aid > 0U && aid < 1000U && atp < 256U) {
+                    cand.validSp    = true;
+                    cand.animalId   = aid;
+                    cand.animalType = atp;
+                    break;
+                }
+            }
+            if (outCandCount < maxCands) {
+                outCands[outCandCount++] = cand;
+            }
+        }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+void PushRareHistoryLocked(const RareHistoryEntry& e) {
+    for (std::size_t i = kRareHistoryCap - 1U; i > 0U; --i) {
+        g_rareHistory[i] = g_rareHistory[i - 1U];
+    }
+    if (g_rareHistoryCount < kRareHistoryCap) ++g_rareHistoryCount;
+    g_rareHistory[0] = e;
+}
+
+void FormatRareEntryText(const RareHistoryEntry& e, bool en, char* buf, std::size_t cap) {
+    const std::string sp = e.validSp ? FormatSpeciesCode(e.animalId, e.animalType) : std::string("-");
+    const char* outcome  = e.spawned ? (en ? "SPAWN" : u8"命中") : (en ? "MISS" : u8"未出");
+    const char* ovTag    = e.overridden ? (en ? "[OVR]" : u8"[改]") : "";
+    if (e.siteKind == 1U) {
+        std::snprintf(buf, cap,
+                      en ? "[endemic/rare] %s%s %s -> %s | RegionIdx:%d | Prob:%.2f%%"
+                         : u8"[endemic/rare] %s%s %s -> %s | 聚魔地区编号:%d | 概率:%.2f%%",
+                      RareSiteTag(1U, en), ovTag, sp.c_str(), outcome,
+                      e.extra,
+                      e.effProb >= 0.0f ? static_cast<double>(e.effProb) * 100.0 : 0.0);
+    } else if (e.siteKind == 3U) {
+        std::snprintf(buf, cap,
+                      en ? "[endemic/rare] %s%s %s -> Slot#%d"
+                         : u8"[endemic/rare] %s%s %s -> 胜出槽位#%d",
+                      RareSiteTag(3U, en), ovTag, sp.c_str(), e.extra);
+    } else {
+        const char* phaseTag = e.isInit ? (en ? "Init" : u8"进图") : (en ? "Hour" : u8"整点");
+        std::snprintf(buf, cap,
+                      en ? "[endemic/rare] %s%s(%s) %s -> %s | Prob:%.2f%% | %s %u-%uh"
+                         : u8"[endemic/rare] %s%s(%s) %s -> %s | 概率:%.2f%% | %s %u-%uh",
+                      RareSiteTag(e.siteKind, en), ovTag, phaseTag, sp.c_str(), outcome,
+                      e.effProb >= 0.0f ? static_cast<double>(e.effProb) * 100.0 : 0.0,
+                      WeatherGateTag(e.extra, en),
+                      static_cast<unsigned>(e.startHour), static_cast<unsigned>(e.endHour));
+    }
+}
+
+void EmitRareLogAsync(const RareHistoryEntry& e) {
+    if (!g_host || !g_host->ChatPrintfAsync) return;
+    char line[256]{};
+    FormatRareEntryText(e, IsEn(), line, sizeof(line));
+    g_host->ChatPrintfAsync("%s", line);
+}
+
+void HandleSimpleRarePre(RareTlsRollCtx& tls, MhwRngHookDecision* ioDecision) {
+    std::lock_guard<std::mutex> lk(g_stateMx);
+    const RarePolicy* pol = FindActiveRarePolicyLocked(tls.valid, tls.animalId, tls.animalType);
+    if (pol->mode == RareMode::kForceOn) {
+        ioDecision->action = kMhwRngActionReturnValue;
+        ioDecision->condId = pol->condId;
+        ioDecision->value0 = kRareForceU32;
+        tls.overridden     = true;
+    } else if (pol->mode == RareMode::kForceOff) {
+        ioDecision->action = kMhwRngActionReturnValue;
+        ioDecision->condId = pol->condId;
+        ioDecision->value0 = kRareBlockU32;
+        tls.overridden     = true;
+    } else {
+        ioDecision->action = kMhwRngActionUseCondition;
+        ioDecision->condId = 0U;
+    }
+}
+
+template <bool (*ReadFn)(const MhwRngDrawContext*, RareTlsRollCtx&)>
+void HandleSimpleRarePost(const MhwRngDrawContext* ctx, std::uint8_t expectedKind) {
+    if (!ctx) return;
+    const bool isObserve = ((ctx->callFlags & kMhwRngDrawFlagObserveOnly) != 0U);
+    if (!tls_lastRareRoll.valid || tls_lastRareRoll.siteKind != expectedKind) {
+        if (!ReadFn(ctx, tls_lastRareRoll)) return;
+    }
+
+    const float roll = static_cast<float>(static_cast<std::uint64_t>(ctx->finalValue0)) * (1.0f / 4294967296.0f);
+    const bool spawned = (tls_lastRareRoll.effProb >= 0.0f)
+                             ? (roll <= tls_lastRareRoll.effProb)
+                             : (ctx->finalValue0 == kRareForceU32);
+
+    RareHistoryEntry entry{};
+    entry.siteKind   = expectedKind;
+    entry.validSp    = tls_lastRareRoll.valid;
+    entry.spawned    = spawned;
+    entry.overridden = tls_lastRareRoll.overridden && !isObserve;
+    entry.isInit     = tls_lastRareRoll.isInit;
+    entry.animalId   = tls_lastRareRoll.animalId;
+    entry.animalType = tls_lastRareRoll.animalType;
+    entry.extra      = tls_lastRareRoll.extra;
+    entry.effProb    = tls_lastRareRoll.effProb;
+    entry.startHour  = tls_lastRareRoll.startHour;
+    entry.endHour    = tls_lastRareRoll.endHour;
+
+    bool emitLog = false;
+    {
+        std::lock_guard<std::mutex> lk(g_stateMx);
+        PushRareHistoryLocked(entry);
+        emitLog = g_rareLogEnabled && (spawned || entry.overridden);
+    }
+    tls_lastRareRoll = RareTlsRollCtx{};
+    if (emitLog) {
+        EmitRareLogAsync(entry);
+    }
+}
+
+void __fastcall OnRareMasterDrawPre(const MhwRngDrawContext* ctx, MhwRngHookDecision* ioDecision, void*) {
+    if (!ioDecision) return;
+    ReadRareMasterCtxSEH(ctx, tls_lastRareRoll);
+    HandleSimpleRarePre(tls_lastRareRoll, ioDecision);
+}
+
+void __fastcall OnRareMasterDrawPost(const MhwRngDrawContext* ctx, MhwRngHookDecision*, void*) {
+    HandleSimpleRarePost<&ReadRareMasterCtxSEH>(ctx, 0U);
+}
+
+void __fastcall OnRareMolyDrawPre(const MhwRngDrawContext* ctx, MhwRngHookDecision* ioDecision, void*) {
+    if (!ioDecision) return;
+    ReadRareMolyCtxSEH(ctx, tls_lastRareRoll);
+    HandleSimpleRarePre(tls_lastRareRoll, ioDecision);
+}
+
+void __fastcall OnRareMolyDrawPost(const MhwRngDrawContext* ctx, MhwRngHookDecision*, void*) {
+    HandleSimpleRarePost<&ReadRareMolyCtxSEH>(ctx, 1U);
+}
+
+void __fastcall OnRareGroupDrawPre(const MhwRngDrawContext* ctx, MhwRngHookDecision* ioDecision, void*) {
+    if (!ioDecision) return;
+    if (!ReadRareGroupCtxSEH(ctx, tls_lastRareRoll)) {
+        ioDecision->action = kMhwRngActionUseCondition;
+        ioDecision->condId = 0U;
+        return;
+    }
+    HandleSimpleRarePre(tls_lastRareRoll, ioDecision);
+}
+
+void __fastcall OnRareGroupDrawPost(const MhwRngDrawContext* ctx, MhwRngHookDecision*, void*) {
+    HandleSimpleRarePost<&ReadRareGroupCtxSEH>(ctx, 2U);
+}
+
+void __fastcall OnRareMutexDrawPre(const MhwRngDrawContext* ctx, MhwRngHookDecision* ioDecision, void*) {
+    if (!ioDecision) return;
+    tls_lastRareMutex = RareMutexTlsCtx{};
+
+    RareMutexCand cands[kMaxRareMutexSlots]{};
+    std::size_t   candCount  = 0U;
+    std::uint32_t groupCount = 0U;
+    if (!ScanRareMutexGroupSEH(ctx, cands, kMaxRareMutexSlots, candCount, groupCount)) {
+        ioDecision->action = kMhwRngActionUseCondition;
+        ioDecision->condId = 0U;
+        return;
+    }
+
+    tls_lastRareMutex.valid      = true;
+    tls_lastRareMutex.groupCount = groupCount;
+    tls_lastRareMutex.candCount  = candCount;
+    if (candCount > 0U) {
+        std::memcpy(tls_lastRareMutex.cands, cands, candCount * sizeof(RareMutexCand));
+    }
+
+    std::uint32_t speciesIndices[kMaxRareMutexSlots]{};
+    std::size_t   speciesCount = 0U;
+    std::uint32_t anyForceIndices[kMaxRareMutexSlots]{};
+    std::size_t   anyForceCount = 0U;
+    {
+        std::lock_guard<std::mutex> lk(g_stateMx);
+        if (!HasAnyRareForceOnLocked() || candCount == 0U) {
+            ioDecision->action = kMhwRngActionUseCondition;
+            ioDecision->condId = 0U;
+            return;
+        }
+        for (std::size_t i = 0U; i < candCount; ++i) {
+            const RareMutexCand& c = cands[i];
+            bool isSpRule = false;
+            const RarePolicy* pol = FindActiveRarePolicyLocked(c.validSp, c.animalId, c.animalType, &isSpRule);
+            if (pol->mode == RareMode::kForceOn) {
+                anyForceIndices[anyForceCount++] = c.k;
+                if (isSpRule) {
+                    speciesIndices[speciesCount++] = c.k;
+                }
+            }
+        }
+    }
+
+    const std::uint32_t* pool = (speciesCount > 0U) ? speciesIndices : anyForceIndices;
+    const std::size_t    cnt  = (speciesCount > 0U) ? speciesCount   : anyForceCount;
+    if (cnt == 0U) {
+        ioDecision->action = kMhwRngActionUseCondition;
+        ioDecision->condId = 0U;
+        return;
+    }
+
+    std::size_t pick = 0U;
+    if (cnt > 1U && ctx && ctx->DrawDeterministic) {
+        pick = static_cast<std::size_t>(ctx->DrawDeterministic(kRvaRareMutexTieBreak, 0U)) % cnt;
+    }
+    const std::uint32_t winnerK  = pool[pick];
+    tls_lastRareMutex.overridden = true;
+    tls_lastRareMutex.winnerK    = winnerK;
+    ioDecision->action = kMhwRngActionReturnValue;
+    ioDecision->condId = 0U;
+    ioDecision->value0 = winnerK;
+}
+
+void __fastcall OnRareMutexDrawPost(const MhwRngDrawContext* ctx, MhwRngHookDecision*, void*) {
+    if (!ctx) return;
+    const bool isObserve = ((ctx->callFlags & kMhwRngDrawFlagObserveOnly) != 0U);
+    if (!tls_lastRareMutex.valid) {
+        if (!ScanRareMutexGroupSEH(ctx, tls_lastRareMutex.cands, kMaxRareMutexSlots,
+                                   tls_lastRareMutex.candCount, tls_lastRareMutex.groupCount)) {
+            return;
+        }
+        tls_lastRareMutex.valid = true;
+    }
+    const std::uint32_t gCnt = tls_lastRareMutex.groupCount;
+    if (gCnt == 0U) {
+        tls_lastRareMutex = RareMutexTlsCtx{};
+        return;
+    }
+
+    const bool wasOverridden = tls_lastRareMutex.overridden && !isObserve;
+    const std::uint32_t winK = wasOverridden ? tls_lastRareMutex.winnerK : (ctx->finalValue0 % gCnt);
+
+    RareHistoryEntry entry{};
+    entry.siteKind   = 3U;
+    entry.overridden = wasOverridden;
+    entry.extra      = static_cast<std::int32_t>(winK);
+    for (std::size_t i = 0U; i < tls_lastRareMutex.candCount; ++i) {
+        if (tls_lastRareMutex.cands[i].k == winK) {
+            entry.spawned    = true;
+            entry.validSp    = tls_lastRareMutex.cands[i].validSp;
+            entry.animalId   = tls_lastRareMutex.cands[i].animalId;
+            entry.animalType = tls_lastRareMutex.cands[i].animalType;
+            break;
+        }
+    }
+
+    bool emitLog = false;
+    {
+        std::lock_guard<std::mutex> lk(g_stateMx);
+        PushRareHistoryLocked(entry);
+        emitLog = g_rareLogEnabled && (wasOverridden || entry.spawned);
+    }
+    tls_lastRareMutex = RareMutexTlsCtx{};
+    if (emitLog) {
+        EmitRareLogAsync(entry);
+    }
+}
+
+bool __fastcall FormatEndemicRareSlotStatus(const MhwRngSlotSnapshot* snap,
+                                            char* outBuf,
+                                            std::size_t bufCap,
+                                            void*) {
+    if (!snap || !outBuf || bufCap == 0U) return false;
+    const bool en = IsEn();
+    std::lock_guard<std::mutex> lk(g_stateMx);
+    if (snap->condId == 0U) {
+        if (g_globalRarePolicy.mode != RareMode::kVanilla) {
+            std::snprintf(outBuf, bufCap, "%s", FormatRareModeSummary(g_globalRarePolicy.mode, en));
+            return true;
+        }
+        if (!g_speciesRarePolicies.empty()) {
+            std::snprintf(outBuf, bufCap,
+                          en ? "Per-species rare rules (%zu active)" : u8"按物种稀有分流(%zu条专属规则)",
+                          g_speciesRarePolicies.size());
+            return true;
+        }
+        return false;
+    }
+    for (const auto& p : g_speciesRarePolicies) {
+        if (p.condId == snap->condId && p.mode != RareMode::kVanilla) {
+            std::snprintf(outBuf, bufCap, "%s: %s",
+                          FormatSpeciesCode(p.animalId, p.animalType).c_str(),
+                          FormatRareModeSummary(p.mode, en));
+            return true;
+        }
+    }
+    return false;
+}
+
+// ============================================================================
 //  `$rng endemic ...` Subcommand Parsing & Telemetry Output
 // ============================================================================
 
@@ -884,18 +1567,262 @@ void PrintEndemicHistory(bool showAll) {
     }
 }
 
+void PrintRareHistory(bool showAll) {
+    const bool en = IsEn();
+    RareHistoryEntry snap[kRareHistoryCap]{};
+    std::size_t count = 0U;
+    {
+        std::lock_guard<std::mutex> lk(g_stateMx);
+        count = g_rareHistoryCount;
+        for (std::size_t i = 0U; i < count; ++i) snap[i] = g_rareHistory[i];
+    }
+    if (count == 0U) {
+        g_host->ChatPrint(en ? "[endemic/rare] No rare spawn rolls recorded yet; enter a quest/expedition first"
+                             : u8"[endemic/rare] 尚无稀有生物抽签记录；进入探索/任务/聚魔后自动记录");
+        return;
+    }
+    const std::size_t limit = showAll ? count : 1U;
+    for (std::size_t i = 0U; i < limit; ++i) {
+        char line[256]{};
+        FormatRareEntryText(snap[i], en, line, sizeof(line));
+        g_host->ChatPrintf("#%zu %s", i + 1U, line);
+    }
+}
+
+void PrintRareStatus() {
+    const bool en = IsEn();
+    RarePolicy              globalRare{};
+    std::vector<RarePolicy> spRare;
+    bool                    logEnabled = false;
+    {
+        std::lock_guard<std::mutex> lk(g_stateMx);
+        globalRare = g_globalRarePolicy;
+        spRare     = g_speciesRarePolicies;
+        logEnabled = g_rareLogEnabled;
+    }
+    g_host->ChatPrintf(en ? "[endemic/rare] Global: %s | Species rules: %zu | Log: %s"
+                          : u8"[endemic/rare] 全局稀有: %s | 专属规则: %zu 条 | 播报: %s",
+                       FormatRareModeSummary(globalRare.mode, en),
+                       spRare.size(),
+                       logEnabled ? "on" : "off");
+    const std::size_t showN = std::min<std::size_t>(spRare.size(), 4U);
+    for (std::size_t i = 0U; i < showN; ++i) {
+        const auto& p = spRare[i];
+        g_host->ChatPrintf(en ? "[endemic/rare] Rule %s -> %s" : u8"[endemic/rare] 专属 %s -> %s",
+                           FormatSpeciesCode(p.animalId, p.animalType).c_str(),
+                           FormatRareModeSummary(p.mode, en));
+    }
+    if (spRare.size() > showN) {
+        g_host->ChatPrintf(en ? "[endemic/rare] ...and %zu more rare rule(s)" : u8"[endemic/rare] ...另有 %zu 条稀有专属规则",
+                           spRare.size() - showN);
+    }
+    PrintRareHistory(false);
+}
+
+void ClearRareSlotConditions() {
+    if (!g_host) return;
+    g_host->ClearSlotAllConditions(kRvaRareMasterRoll);
+    g_host->ClearSlotAllConditions(kRvaRareMolyRoll);
+    g_host->ClearSlotAllConditions(kRvaRareGroupRoll);
+    g_host->ClearSlotAllConditions(kRvaRareMutexTieBreak);
+}
+
+bool ParseRareModeToken(const std::string& tok, RareMode& outMode, bool& outIsClear) noexcept {
+    outIsClear = false;
+    if (tok == "on" || tok == "100" || tok == "100%" || tok == "force" || tok == "1") {
+        outMode = RareMode::kForceOn;
+        return true;
+    }
+    if (tok == "0" || tok == "0%" || tok == "block" || tok == "none" || tok == "deny") {
+        outMode = RareMode::kForceOff;
+        return true;
+    }
+    if (tok == "off" || tok == "clear" || tok == "reset" || tok == "vanilla") {
+        outMode    = RareMode::kVanilla;
+        outIsClear = true;
+        return true;
+    }
+    return false;
+}
+
+bool RemoveSpeciesRareRuleLocked(std::uint32_t aid, std::uint32_t atp) {
+    const std::size_t before = g_speciesRarePolicies.size();
+    g_speciesRarePolicies.erase(
+        std::remove_if(g_speciesRarePolicies.begin(), g_speciesRarePolicies.end(),
+                       [&](const RarePolicy& p) { return p.animalId == aid && p.animalType == atp; }),
+        g_speciesRarePolicies.end());
+    return g_speciesRarePolicies.size() != before;
+}
+
+void ApplySpeciesRareRule(std::uint32_t aid, std::uint32_t atp, RareMode mode, bool isClear) {
+    const bool en = IsEn();
+    const std::string code = FormatSpeciesCode(aid, atp);
+    if (isClear || mode == RareMode::kVanilla) {
+        {
+            std::lock_guard<std::mutex> lk(g_stateMx);
+            RemoveSpeciesRareRuleLocked(aid, atp);
+        }
+        g_host->ChatPrintf(en ? "[endemic/rare] Removed rare rule for %s"
+                              : u8"[endemic/rare] 已移除 %s 的稀有专属规则",
+                           code.c_str());
+        return;
+    }
+    const RarePolicy pol{mode, aid, atp, MakeSpeciesCondId(aid, atp)};
+    {
+        std::lock_guard<std::mutex> lk(g_stateMx);
+        bool updated = false;
+        for (auto& existing : g_speciesRarePolicies) {
+            if (existing.animalId == aid && existing.animalType == atp) {
+                existing = pol;
+                updated  = true;
+                break;
+            }
+        }
+        if (!updated) g_speciesRarePolicies.push_back(pol);
+    }
+    g_host->ChatPrintf(en ? "[endemic/rare] Set %s -> %s (respects vanilla weather/time/level gates)"
+                          : u8"[endemic/rare] 已设专属 %s -> %s (仍遵守原版天气/时段/聚魔等级条件)",
+                       code.c_str(), FormatRareModeSummary(mode, en));
+}
+
+void PrintRareHelp() {
+    const bool en = IsEn();
+    if (en) {
+        g_host->ChatPrint("[endemic/rare] Pure-RNG mode (respects weather, time-of-day & Guiding Lands level):");
+        g_host->ChatPrint("[endemic/rare] Global: `$rng endemic rare on|0%|off` | Species: `$rng endemic rare ec058 on|0%|off` or `rare wintermoon_nettle on`");
+        g_host->ChatPrint("[endemic/rare] Log/History: `$rng endemic rare log [on|off]` | `history` | `status`");
+    } else {
+        g_host->ChatPrint(u8"[endemic/rare] 纯 RNG 模式(含大型个体鱼与地区稀有毛吉，仍遵守原版天气/时段/聚魔等级):");
+        g_host->ChatPrint(u8"[endemic/rare] 全局: `$rng endemic rare on|0%|off` | 按物种: `$rng endemic rare ec058 on|0%|off` 或 `rare 月羽天母 on` (支持简中名/英文别名)");
+        g_host->ChatPrint(u8"[endemic/rare] 播报/记录: `$rng endemic rare log [on|off]` | `history` | `status`");
+    }
+}
+
+void HandleRareSubcommand(int argc, const char* const* argv) {
+    const bool en = IsEn();
+    if (argc == 0) {
+        PrintRareStatus();
+        return;
+    }
+    const std::string r0 = LowerAscii(argv[0]);
+    if (r0 == "status" || r0 == "info") {
+        PrintRareStatus();
+        return;
+    }
+    if (r0 == "help" || r0 == "?") {
+        PrintRareHelp();
+        return;
+    }
+    if (r0 == "history" || r0 == "recent") {
+        PrintRareHistory(true);
+        return;
+    }
+    if (r0 == "log") {
+        bool nextLog = false;
+        if (argc >= 2) {
+            const std::string lv = LowerAscii(argv[1]);
+            if (lv == "on" || lv == "1" || lv == "true") {
+                std::lock_guard<std::mutex> lk(g_stateMx);
+                g_rareLogEnabled = true;
+                nextLog          = true;
+            } else if (lv == "off" || lv == "0" || lv == "false") {
+                std::lock_guard<std::mutex> lk(g_stateMx);
+                g_rareLogEnabled = false;
+                nextLog          = false;
+            } else {
+                g_host->ChatPrint(en ? "[endemic/rare] Usage: `$rng endemic rare log [on|off]`"
+                                     : u8"[endemic/rare] 用法: `$rng endemic rare log [on|off]`");
+                return;
+            }
+        } else {
+            std::lock_guard<std::mutex> lk(g_stateMx);
+            g_rareLogEnabled = !g_rareLogEnabled;
+            nextLog          = g_rareLogEnabled;
+        }
+        g_host->ChatPrintf(en ? "[endemic/rare] Live rare spawn log: %s"
+                              : u8"[endemic/rare] 稀有生物刷新实时播报: %s",
+                           nextLog ? "on" : "off");
+        return;
+    }
+
+    std::uint32_t aid = 0U, atp = kAnyAnimalType;
+    if (ParseSpeciesSelector(argv[0], aid, atp)) {
+        if (argc < 2) {
+            g_host->ChatPrintf(en ? "[endemic/rare] Usage: `$rng endemic rare %s <on|0%|off>`"
+                                  : u8"[endemic/rare] 用法: `$rng endemic rare %s <on|0%|off>`",
+                               argv[0]);
+            return;
+        }
+        RareMode mode = RareMode::kVanilla;
+        bool isClear = false;
+        if (!ParseRareModeToken(LowerAscii(argv[1]), mode, isClear) || argc > 2) {
+            g_host->ChatPrint(en ? "[endemic/rare] Invalid mode; use `on` / `0%` / `block` / `off`"
+                                 : u8"[endemic/rare] 参数无效；支持 `on` / `0%` / `block` / `off`");
+            return;
+        }
+        ApplySpeciesRareRule(aid, atp, mode, isClear);
+        return;
+    }
+
+    RareMode mode = RareMode::kVanilla;
+    bool isClear = false;
+    if (!ParseRareModeToken(r0, mode, isClear)) {
+        g_host->ChatPrintf(en ? "[endemic/rare] Unknown arg `%s`; type `$rng endemic rare help`"
+                              : u8"[endemic/rare] 未知参数 `%s`；输 `$rng endemic rare help` 查看用法",
+                           argv[0]);
+        return;
+    }
+
+    if (isClear) {
+        if (argc >= 2 && ParseSpeciesSelector(argv[1], aid, atp)) {
+            ApplySpeciesRareRule(aid, atp, RareMode::kVanilla, true);
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_stateMx);
+            g_globalRarePolicy = RarePolicy{};
+            g_speciesRarePolicies.clear();
+        }
+        ClearRareSlotConditions();
+        g_host->ChatPrint(en ? "[endemic/rare] Cleared rare spawn rules -> vanilla RNG"
+                             : u8"[endemic/rare] 已清空稀有生物生成规则 -> 恢复正常随机");
+        return;
+    }
+
+    if (argc >= 2 && ParseSpeciesSelector(argv[1], aid, atp)) {
+        g_host->ChatPrintf(en ? "[endemic/rare] Order hint: put species first, e.g. `$rng endemic rare %s %s`"
+                              : u8"[endemic/rare] 顺序提示: 按物种设置请把代号放前面，例如 `$rng endemic rare %s %s`",
+                           argv[1], argv[0]);
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(g_stateMx);
+        g_globalRarePolicy = RarePolicy{mode, 0U, kAnyAnimalType, 0U};
+    }
+    g_host->ChatPrintf(en ? "[endemic/rare] Global rare spawn -> %s"
+                          : u8"[endemic/rare] 已设全局稀有生成 -> %s",
+                       FormatRareModeSummary(mode, en));
+}
+
 void PrintEndemicStatus() {
     const bool en = IsEn();
     EndemicPolicy              globalSnap{};
     std::vector<EndemicPolicy> spSnaps;
+    RareMode                   rareMode = RareMode::kVanilla;
+    std::size_t                rareSpCnt = 0U;
+    bool                       rareLog   = false;
     {
         std::lock_guard<std::mutex> lk(g_stateMx);
         globalSnap = g_globalPolicy;
         spSnaps    = g_speciesPolicies;
+        rareMode   = g_globalRarePolicy.mode;
+        rareSpCnt  = g_speciesRarePolicies.size();
+        rareLog    = g_rareLogEnabled;
     }
 
-    g_host->ChatPrintf(en ? "[endemic] Global: %s | Per-species rules: %zu"
-                          : u8"[endemic] 全局策略: %s | 按物种专属规则: %zu 条",
+    g_host->ChatPrintf(en ? "[endemic] Global size: %s | Size rules: %zu"
+                          : u8"[endemic] 全局尺寸: %s | 尺寸专属规则: %zu 条",
                        FormatPolicySummary(globalSnap, en).c_str(),
                        spSnaps.size());
     const std::size_t showN = std::min<std::size_t>(spSnaps.size(), 4U);
@@ -909,6 +1836,11 @@ void PrintEndemicStatus() {
         g_host->ChatPrintf(en ? "[endemic] ...and %zu more rule(s) active" : u8"[endemic] ...另有 %zu 条专属规则生效中",
                            spSnaps.size() - showN);
     }
+    g_host->ChatPrintf(en ? "[endemic] Rare spawn: %s | Rare rules: %zu | Log: %s (`$rng endemic rare`)"
+                          : u8"[endemic] 稀有生成: %s | 稀有专属: %zu 条 | 播报: %s (`$rng endemic rare`)",
+                       FormatRareModeSummary(rareMode, en),
+                       rareSpCnt,
+                       rareLog ? "on" : "off");
     PrintEndemicHistory(false);
 }
 
@@ -921,6 +1853,10 @@ void __fastcall Cmd_Endemic(int argc, const char* const* argv, const char*, void
     }
 
     const std::string a0 = LowerAscii(argv[0]);
+    if (a0 == "rare") {
+        HandleRareSubcommand(argc - 1, argv + 1);
+        return;
+    }
     if (a0 == "status" || a0 == "info") {
         PrintEndemicStatus();
         return;
@@ -931,12 +1867,12 @@ void __fastcall Cmd_Endemic(int argc, const char* const* argv, const char*, void
     }
     if (a0 == "help" || a0 == "?") {
         if (en) {
-            g_host->ChatPrint("[endemic] Global: `$rng endemic min|normal|max [0~100]` | `exact 1.2x` | `exact 30cm`");
-            g_host->ChatPrint("[endemic] Species: `$rng endemic ec059 max` (all variants) or `$rng endemic ec059_02 min`");
+            g_host->ChatPrint("[endemic] Size: `$rng endemic min|normal|max [0~100]` | `exact 1.2x` | `exact 30cm` | `ec059 max`");
+            g_host->ChatPrint("[endemic] Rare: `$rng endemic rare on|0%|off|log|history` | `rare ec058 on` | `rare wintermoon_nettle on` | `ec058 rare on`");
             g_host->ChatPrint("[endemic] History/Clear: `$rng endemic history` | `clear` | `ec059 clear`");
         } else {
-            g_host->ChatPrint(u8"[endemic] 全局: `$rng endemic min|normal|max [0~100]` | `exact 1.2x` | `exact 30cm`");
-            g_host->ChatPrint(u8"[endemic] 按物种: `$rng endemic ec059 max` (全亚种) 或 `$rng endemic ec059_02 min` (单变种)");
+            g_host->ChatPrint(u8"[endemic] 尺寸: `$rng endemic min|normal|max [0~100]` | `exact 1.2x` | `exact 30cm` | `ec059 max`");
+            g_host->ChatPrint(u8"[endemic] 稀有: `$rng endemic rare on|0%|off|log|history` | `rare ec058 on` | `rare 月羽天母 on` | `ec058 rare on`");
             g_host->ChatPrint(u8"[endemic] 记录/清理: `$rng endemic history` (查刷出代号与cm) | `clear` | `ec059 clear`");
         }
         return;
@@ -951,23 +1887,27 @@ void __fastcall Cmd_Endemic(int argc, const char* const* argv, const char*, void
                         std::remove_if(g_speciesPolicies.begin(), g_speciesPolicies.end(),
                                        [&](const EndemicPolicy& p) { return p.animalId == aid && p.animalType == atp; }),
                         g_speciesPolicies.end());
+                    RemoveSpeciesRareRuleLocked(aid, atp);
                 }
-                g_host->ChatPrintf(en ? "[endemic] Removed rule for %s" : u8"[endemic] 已移除 %s 的专属尺寸规则",
+                g_host->ChatPrintf(en ? "[endemic] Removed rules for %s" : u8"[endemic] 已移除 %s 的专属规则",
                                    FormatSpeciesCode(aid, atp).c_str());
                 return;
             }
         }
         {
             std::lock_guard<std::mutex> lk(g_stateMx);
-            g_globalPolicy = EndemicPolicy{};
+            g_globalPolicy     = EndemicPolicy{};
             g_speciesPolicies.clear();
+            g_globalRarePolicy = RarePolicy{};
+            g_speciesRarePolicies.clear();
         }
         g_host->ClearSlotAllConditions(kRvaCrownTierRoll);
         g_host->ClearSlotAllConditions(kRvaFieldRangeStd);
         g_host->ClearSlotAllConditions(kRvaFieldRangeSpec);
         g_host->ClearSlotAllConditions(kRvaCaptureIntraTierRoll);
-        g_host->ChatPrint(en ? "[endemic] Cleared all endemic size rules -> vanilla RNG"
-                             : u8"[endemic] 已清空全部环境生物尺寸规则 -> 恢复正常随机");
+        ClearRareSlotConditions();
+        g_host->ChatPrint(en ? "[endemic] Cleared all endemic size & rare rules -> vanilla RNG"
+                             : u8"[endemic] 已清空全部环境生物尺寸与稀有生成规则 -> 恢复正常随机");
         return;
     }
 
@@ -975,12 +1915,27 @@ void __fastcall Cmd_Endemic(int argc, const char* const* argv, const char*, void
     if (ParseSpeciesSelector(argv[0], aid, atp)) {
         const std::string code = FormatSpeciesCode(aid, atp);
         if (argc < 2) {
-            g_host->ChatPrintf(en ? "[endemic] Usage: `$rng endemic %s <min|normal|max|exact 1.2x|clear>`"
-                                  : u8"[endemic] 用法: `$rng endemic %s <min|normal|max|exact 1.2x|clear>`",
+            g_host->ChatPrintf(en ? "[endemic] Usage: `$rng endemic %s <min|normal|max|exact 1.2x|rare [on|0%|off]|clear>`"
+                                  : u8"[endemic] 用法: `$rng endemic %s <min|normal|max|exact 1.2x|rare [on|0%|off]|clear>`",
                                argv[0]);
             return;
         }
         const std::string sub = LowerAscii(argv[1]);
+        if (sub == "rare") {
+            if (argc == 2) {
+                ApplySpeciesRareRule(aid, atp, RareMode::kForceOn, false);
+                return;
+            }
+            RareMode mode = RareMode::kVanilla;
+            bool isClear = false;
+            if (!ParseRareModeToken(LowerAscii(argv[2]), mode, isClear) || argc > 3) {
+                g_host->ChatPrint(en ? "[endemic/rare] Invalid mode; use `on` / `0%` / `block` / `off`"
+                                     : u8"[endemic/rare] 参数无效；支持 `on` / `0%` / `block` / `off`");
+                return;
+            }
+            ApplySpeciesRareRule(aid, atp, mode, isClear);
+            return;
+        }
         if (sub == "clear" || sub == "off" || sub == "reset") {
             {
                 std::lock_guard<std::mutex> lk(g_stateMx);
@@ -988,8 +1943,9 @@ void __fastcall Cmd_Endemic(int argc, const char* const* argv, const char*, void
                     std::remove_if(g_speciesPolicies.begin(), g_speciesPolicies.end(),
                                    [&](const EndemicPolicy& p) { return p.animalId == aid && p.animalType == atp; }),
                     g_speciesPolicies.end());
+                RemoveSpeciesRareRuleLocked(aid, atp);
             }
-            g_host->ChatPrintf(en ? "[endemic] Removed rule for %s" : u8"[endemic] 已移除 %s 的专属尺寸规则", code.c_str());
+            g_host->ChatPrintf(en ? "[endemic] Removed rules for %s" : u8"[endemic] 已移除 %s 的专属规则", code.c_str());
             return;
         }
 
@@ -1001,8 +1957,8 @@ void __fastcall Cmd_Endemic(int argc, const char* const* argv, const char*, void
             return;
         }
         if (pr != ParseResult::kOk) {
-            g_host->ChatPrint(en ? "[endemic] Invalid args; use min / normal / max / exact <val> / clear"
-                                 : u8"[endemic] 参数无效；支持 `min` / `normal` / `max` / `exact <值>` / `clear`");
+            g_host->ChatPrint(en ? "[endemic] Invalid args; use min / normal / max / exact <val> / rare / clear"
+                                 : u8"[endemic] 参数无效；支持 `min` / `normal` / `max` / `exact <值>` / `rare` / `clear`");
             return;
         }
 
@@ -1055,7 +2011,7 @@ void __fastcall Cmd_Endemic(int argc, const char* const* argv, const char*, void
 void __fastcall Complete_Endemic(const char*,
                                  int argc,
                                  const char* const* argv,
-                                 const char*,
+                                 const char* prefix,
                                  MhwRngCompletionSinkFn addCand,
                                  void* sinkCtx,
                                  void*) {
@@ -1064,30 +2020,74 @@ void __fastcall Complete_Endemic(const char*,
     {
         std::lock_guard<std::mutex> lk(g_stateMx);
         for (const auto& p : g_speciesPolicies) {
-            if (p.animalId != 0U) {
-                knownSpecies.push_back(FormatSpeciesCode(p.animalId, p.animalType));
-            }
+            if (p.animalId != 0U) knownSpecies.push_back(FormatSpeciesCodeRaw(p.animalId, p.animalType));
+        }
+        for (const auto& p : g_speciesRarePolicies) {
+            if (p.animalId != 0U) knownSpecies.push_back(FormatSpeciesCodeRaw(p.animalId, p.animalType));
         }
         for (std::size_t i = 0; i < g_historyCount; ++i) {
             if (g_history[i].validSpecies && g_history[i].animalId != 0U) {
-                knownSpecies.push_back(FormatSpeciesCode(g_history[i].animalId, kAnyAnimalType));
-                knownSpecies.push_back(FormatSpeciesCode(g_history[i].animalId, g_history[i].animalType));
+                knownSpecies.push_back(FormatSpeciesCodeRaw(g_history[i].animalId, kAnyAnimalType));
+                knownSpecies.push_back(FormatSpeciesCodeRaw(g_history[i].animalId, g_history[i].animalType));
+            }
+        }
+        for (std::size_t i = 0; i < g_rareHistoryCount; ++i) {
+            if (g_rareHistory[i].validSp && g_rareHistory[i].animalId != 0U) {
+                knownSpecies.push_back(FormatSpeciesCodeRaw(g_rareHistory[i].animalId, kAnyAnimalType));
+                knownSpecies.push_back(FormatSpeciesCodeRaw(g_rareHistory[i].animalId, g_rareHistory[i].animalType));
             }
         }
     }
 
+    // Game-data names:
+    //   - Empty prefix (`prefixEmpty`): lists species names in the active UI language (`e.zh` in `zh`, `e.slug`
+    //     in `en`) in BOTH `rare` contexts (~40 rare + Great-size-fish entries) AND general contexts (all 92
+    //     entries, e.g. `$rng endemic <Tab>` and `$rng endemic clear <Tab>`).
+    //   - Single ASCII character prefix (`!prefixEmpty && !typedSomething`) in non-`rare` contexts: omits the
+    //     92 species names so short keyword completions (`endemic r<Tab>` -> `endemic rare `) stay unambiguous.
+    //   - CJK prefix (`>= 0x80`) or `>= 2` ASCII characters (`typedSomething`): offers `e.zh` + `e.slug` in `zh`,
+    //     or `e.slug` in `en`.
+    const bool prefixEmpty = (!prefix || prefix[0] == '\0');
+    const bool typedSomething =
+        (!prefixEmpty &&
+         (static_cast<unsigned char>(prefix[0]) >= 0x80U || std::strlen(prefix) >= 2U));
+    const bool en = IsEn();
+    auto addNames = [&](bool rareOnly) {
+        if (!rareOnly && !prefixEmpty && !typedSomething) return;
+        for (const auto& e : kEndemicNames) {
+            if (rareOnly && e.isRare != 1U && e.hasGreat == 0U) continue;
+            if (en) {
+                addCand(e.slug, sinkCtx);
+            } else {
+                addCand(e.zh, sinkCtx);
+                if (!prefixEmpty) addCand(e.slug, sinkCtx);
+            }
+        }
+    };
+
     if (argc == 0) {
         static const char* const kTop[] = {
-            "status", "history", "help", "clear", "min", "normal", "max", "exact"
+            "status", "history", "help", "clear", "min", "normal", "max", "exact", "rare"
         };
         for (const char* t : kTop) addCand(t, sinkCtx);
         for (const auto& s : knownSpecies) addCand(s.c_str(), sinkCtx);
+        addNames(false);
         return;
     }
     if (argc == 1 && argv && argv[0]) {
         const std::string a0 = LowerAscii(argv[0]);
+        if (a0 == "rare") {
+            static const char* const kRareTop[] = {
+                "on", "off", "0%", "block", "clear", "status", "history", "log", "help"
+            };
+            for (const char* t : kRareTop) addCand(t, sinkCtx);
+            for (const auto& s : knownSpecies) addCand(s.c_str(), sinkCtx);
+            addNames(true);
+            return;
+        }
         if (a0 == "clear" || a0 == "off" || a0 == "reset") {
             for (const auto& s : knownSpecies) addCand(s.c_str(), sinkCtx);
+            addNames(false);
             return;
         }
         const bool isStandaloneGlobal =
@@ -1100,9 +2100,36 @@ void __fastcall Complete_Endemic(const char*,
         if (!isStandaloneGlobal) {
             std::uint32_t aid = 0U, atp = kAnyAnimalType;
             if (ParseSpeciesSelector(argv[0], aid, atp)) {
-                static const char* const kActions[] = { "min", "normal", "max", "exact", "clear" };
+                static const char* const kActions[] = { "min", "normal", "max", "exact", "rare", "clear" };
                 for (const char* a : kActions) addCand(a, sinkCtx);
             }
+        }
+        return;
+    }
+    if (argc == 2 && argv && argv[0] && argv[1]) {
+        const std::string a0 = LowerAscii(argv[0]);
+        const std::string a1 = LowerAscii(argv[1]);
+        static const char* const kRareModes[] = { "on", "0%", "block", "off", "clear" };
+        if (a0 == "rare") {
+            if (a1 == "log") {
+                addCand("on", sinkCtx);
+                addCand("off", sinkCtx);
+                return;
+            }
+            if (a1 == "clear" || a1 == "off" || a1 == "reset") {
+                for (const auto& s : knownSpecies) addCand(s.c_str(), sinkCtx);
+                addNames(true);
+                return;
+            }
+            std::uint32_t aid = 0U, atp = kAnyAnimalType;
+            if (ParseSpeciesSelector(argv[1], aid, atp)) {
+                for (const char* m : kRareModes) addCand(m, sinkCtx);
+            }
+            return;
+        }
+        std::uint32_t aid = 0U, atp = kAnyAnimalType;
+        if (a1 == "rare" && ParseSpeciesSelector(argv[0], aid, atp)) {
+            for (const char* m : kRareModes) addCand(m, sinkCtx);
         }
     }
 }
@@ -1110,9 +2137,9 @@ void __fastcall Complete_Endemic(const char*,
 const MhwRngPluginDescriptor kPluginDesc = {
     kMhwRngApiVersion,
     "endemic",
-    u8"环境生物尺寸与大小金控制插件",
-    "1.2.0",
-    u8"控制环境生物大小金档位与档内尺寸(直接展开0x0672FBC包装并支持多语言与精确cm反算)"
+    u8"环境生物尺寸与稀有生成控制插件",
+    "1.3.0",
+    u8"控制环境生物大小金档位、精确cm尺寸以及稀有环境生物/大型个体鱼/地区稀有毛吉纯RNG刷出"
 };
 
 } // namespace
@@ -1128,10 +2155,10 @@ MHW_RNG_PLUGIN_EXPORT bool MhwRngPlugin_Init(const MhwRngHostApi* host, MhwRngPl
 
     MhwRng_RegisterPluginInfoBi(
         host, selfId,
-        u8"环境生物尺寸与大小金控制插件",
-        "Endemic Life Size & Crown Controller",
-        u8"控制环境生物大小金档位与精确cm/倍率尺寸",
-        "Endemic life crown tier & exact scale/cm size controller");
+        u8"环境生物尺寸与稀有生成控制插件",
+        "Endemic Life Size, Crown & Rare Controller",
+        u8"控制环境生物大小金档位、精确cm尺寸与稀有生物纯RNG生成",
+        "Endemic life crown tier, exact size & pure-RNG rare spawn controller");
 
     MhwRng_RegisterSiteMetaBi(
         host, selfId,
@@ -1166,25 +2193,66 @@ MHW_RNG_PLUGIN_EXPORT bool MhwRngPlugin_Init(const MhwRngHostApi* host, MhwRngPl
         &FormatEndemicSlotStatus,
         nullptr);
 
-    MhwRngHookDesc hCrown{};
-    hCrown.structSize = sizeof(hCrown);
-    hCrown.rva        = kRvaCrownTierRoll;
-    hCrown.priority   = 0;
-    hCrown.flags      = kMhwRngHookPre | kMhwRngHookPost | kMhwRngHookObserveOnly;
-    hCrown.preFn      = &OnEndemicCrownTierDrawPre;
-    hCrown.postFn     = &OnEndemicCrownTierDrawPost;
-    host->RegisterSlotHookEx(selfId, &hCrown);
+    MhwRng_RegisterSiteMetaBi(
+        host, selfId,
+        kRvaRareMasterRoll,
+        "endemic.rare",
+        u8"稀有环境生物、额外大型个体鱼与毛吉洞刷新抽签 (由 endemic 插件托管)",
+        "Master rare endemic, Great-Size fish & Moly burrow spawn roll (managed by endemic)",
+        &FormatEndemicRareSlotStatus,
+        nullptr);
+    MhwRng_RegisterSiteMetaBi(
+        host, selfId,
+        kRvaRareMolyRoll,
+        "endemic.rare_moly",
+        u8"聚魔之地地区稀有毛吉形态抽签 (由 endemic 插件托管)",
+        "Guiding Lands regional rare Moly variant roll (managed by endemic)",
+        &FormatEndemicRareSlotStatus,
+        nullptr);
+    MhwRng_RegisterSiteMetaBi(
+        host, selfId,
+        kRvaRareGroupRoll,
+        "endemic.rare_group",
+        u8"族群级稀有生物可用性抽签 (由 endemic 插件托管)",
+        "Endemic group-level rare availability roll (managed by endemic)",
+        &FormatEndemicRareSlotStatus,
+        nullptr);
+    MhwRng_RegisterSiteMetaBi(
+        host, selfId,
+        kRvaRareMutexTieBreak,
+        "endemic.rare_mutex",
+        u8"互斥稀有组多选一保底抽签 (防止空槽抹除已刷出的稀有生物)",
+        "Mutually-exclusive rare group tie-breaker (protects forced rare spawns)",
+        &FormatEndemicRareSlotStatus,
+        nullptr);
 
+    auto registerPrePost = [&](std::uint32_t rva, MhwRngSlotHookFn preFn, MhwRngSlotHookFn postFn) {
+        MhwRngHookDesc h{};
+        h.structSize = sizeof(h);
+        h.rva        = rva;
+        h.priority   = 0;
+        h.flags      = kMhwRngHookPre | kMhwRngHookPost | kMhwRngHookObserveOnly;
+        h.preFn      = preFn;
+        h.postFn     = postFn;
+        host->RegisterSlotHookEx(selfId, &h);
+    };
+
+    registerPrePost(kRvaCrownTierRoll, &OnEndemicCrownTierDrawPre, &OnEndemicCrownTierDrawPost);
     host->RegisterSlotHook(selfId, kRvaFieldRangeStd,        &OnFieldStdIntraTierDraw,  nullptr);
     host->RegisterSlotHook(selfId, kRvaFieldRangeSpec,       &OnFieldSpecIntraTierDraw, nullptr);
     host->RegisterSlotHook(selfId, kRvaCaptureIntraTierRoll, &OnCaptureIntraTierDraw,   nullptr);
 
+    registerPrePost(kRvaRareMasterRoll,    &OnRareMasterDrawPre, &OnRareMasterDrawPost);
+    registerPrePost(kRvaRareMolyRoll,      &OnRareMolyDrawPre,   &OnRareMolyDrawPost);
+    registerPrePost(kRvaRareGroupRoll,     &OnRareGroupDrawPre,  &OnRareGroupDrawPost);
+    registerPrePost(kRvaRareMutexTieBreak, &OnRareMutexDrawPre,  &OnRareMutexDrawPost);
+
     MhwRng_RegisterSubcommandBi(
         host, selfId,
         "endemic",
-        "$rng endemic [ecXXX[_YY]] <min|normal|max|exact 1.2x|clear>",
-        u8"环境生物尺寸与大小金控制(覆盖刷新与捕获抽签)",
-        "Control endemic life crown tier & exact scale/cm on spawn and capture",
+        "$rng endemic [ecXXX[_YY]] <min|normal|max|exact 1.2x|rare [on|0%|off]|clear>",
+        u8"环境生物尺寸大小金与稀有生物纯RNG控制",
+        "Control endemic life crown tier, exact size & pure-RNG rare spawns",
         &Cmd_Endemic,
         nullptr);
     MhwRng_RegisterSubcommandCompleter(host, selfId, "endemic", &Complete_Endemic, nullptr);
@@ -1193,9 +2261,13 @@ MHW_RNG_PLUGIN_EXPORT bool MhwRngPlugin_Init(const MhwRngHostApi* host, MhwRngPl
 
 MHW_RNG_PLUGIN_EXPORT void MhwRngPlugin_Shutdown() {
     std::lock_guard<std::mutex> lk(g_stateMx);
-    g_globalPolicy = EndemicPolicy{};
+    g_globalPolicy     = EndemicPolicy{};
     g_speciesPolicies.clear();
-    g_historyCount = 0U;
-    g_host         = nullptr;
-    g_selfId       = 0U;
+    g_historyCount     = 0U;
+    g_globalRarePolicy = RarePolicy{};
+    g_speciesRarePolicies.clear();
+    g_rareLogEnabled   = false;
+    g_rareHistoryCount = 0U;
+    g_host             = nullptr;
+    g_selfId           = 0U;
 }

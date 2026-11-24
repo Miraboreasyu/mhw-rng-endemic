@@ -1,11 +1,13 @@
-# `rng_endemic` 官方插件技术文档（环境生物尺寸与大小金控制）
+# `rng_endemic` 官方插件技术文档（环境生物尺寸大小金 & 稀有生物生成控制）
 
-- **插件标识**：`endemic`（编译产物 `rng_endemic.dll`，版本 `1.1.0`）
+- **插件标识**：`endemic`（编译产物 `rng_endemic.dll`，版本 `1.3.0`）
 - **源码位置**：[endemic_plugin.cpp](endemic_plugin.cpp)
 - **宿主依赖**：`mhw_rng.dll`（Plugin SDK `kMhwRngApiVersion == 3`，头文件 [mhw_rng_api.h](include/mhw_rng_api.h)）
-- **接管调用点**：`0x166CFE1`（档位抽取）、`0x1D2A472` / `0x1D2A3CC`（经微内核内置 `0x0672FBC` 透明包装展开后的地图刷新档内插值）、`0x1669CB6`（捕获时档内插值）
+- **接管调用点（共 8 处，全部经 `RegisterSlotHookEx` 零补丁挂钩）**：
+  - **尺寸与大小金（4 处）**：`0x166CFE1`（档位抽取）、`0x1D2A472` / `0x1D2A3CC`（经微内核内置 `0x0672FBC` 透明包装展开后的地图刷新档内插值）、`0x1669CB6`（捕获时档内插值）
+  - **稀有环境生物生成（4 处）**：`0x1A4ACED`（总稀有生物/稀有鱼/额外大型个体鱼/聚魔毛吉洞抽签）、`0x0271F25`（聚魔之地地区稀有毛吉形态抽签）、`0x166D12E`（族群级稀有开关抽签）、`0x1A44FCC`（互斥稀有组多选一保底抽签）
 
-本文档说明 `rng_endemic` 插件所依据的原版环境生物尺寸逆向逻辑、共享随机函数的调用栈过滤机制、按物种条件分流方式以及聊天命令参考。
+本文档说明 `rng_endemic` 插件所依据的原版环境生物尺寸与稀有生成逆向逻辑、调用栈隔离、按物种条件分流以及聊天/控制台命令参考。
 
 ---
 
@@ -54,51 +56,79 @@ return 1; // 兜底返回普通档
 
 ---
 
-## 二、插件实现与安全边界设计
+## 二、游戏原版稀有环境生物生成机制与纯 RNG 控制
 
-### 1. 栈帧上下文溯源与非环境生物调用隔离
-- **档位回调（`0x166CFE1`）**：`FUN_14166ccc0` 入栈 7 个寄存器并 `SUB RSP, 0x80`，调用方返回地址固定位于 `slotPtr[24]`。插件校验 `slotPtr[24]` 是否属于捕获调用点（`0x1669C19`）、常规刷新包装（`0x0271840..0x0271960`）或尾跳转路径（`0x1D2A407`），据此安全读取 `(animalId, animalType)`、实时 `SizeSetData::prob[3]` 与栈上的实时猫饭/悬赏加成 `bonus[3]`（`slotPtr + 5`）。
-- **实时中点求解**：插件直接利用读出的有效概率 `effProb[0..2]` 计算目标档位累计区间的中点 `(cumBefore + 0.5 * effProb[t]) / totalBase` 换算为安全 `uint32_t`（范围 `[0x00000001U, 0xFFFFFF00U]`）。因此：
-  - 即使触发了猫饭大/小体型加成，锁定 `normal`、`mini` 或 `giant` 也不会发生偏移；
-  - 若某个物种本身不设小金或大金档（`effProb == 0`），自动回退到最接近的合法档位。
-- **共享辅助函数保护（`0x0672FBC`）**：`FUN_140672f90` 是游戏多处共用的浮点区间随机函数。插件在 `OnFieldIntraTierDraw` 入口首先读取 `slotPtr[10]`（因 `FUN_140672f90` 仅执行 `SUB RSP, 0x48`），仅当返回地址精确等于 `exeBase + 0x1D2A472` 或 `exeBase + 0x1D2A3CC` 时才接管，其余调用来源直接返回 `UseCondition(0)`，不影响其它系统。
-- **同线程两阶段衔接**：在同一线程上，第二阶段（`0x0672FBC` 或 `0x1669CB6`）紧随第一阶段（`0x166CFE1`）数十条指令后执行。插件通过 `thread_local` 变量将第一阶段识别出的 `(animalId, animalType, chosenTier)` 以及 `exact` 模式算出的精确档内 `uint32_t` 传递给第二阶段，避免重复查表。
-- **档内上界截断处理**：地图刷新路径采用 `CVTTSS2SI` 向下截断至两位小数。对于大金档（`tier == 2`）的 `100%` 档内目标，插件注入 `0xFFFFFFFFU`（单精度转换等于 `1.0f`），确保能达到精确的 `maxScale`；对于小金档（`tier == 0`）与普通档（`tier == 1`），上界保持为 `0xFFFFFF00U`（`< 1.0f`），避免越界进入更高一档。
+游戏在**进图初始化**与**每逢游戏内整点切换**时，会在前置条件满足后走 4 处标准 `MtRandom::nrand` 抽签点：
+
+1. **总稀有刷出判定（`FUN_141a4a9b0` @ `RVA 0x1A4ACED`）**：
+   - 负责柔毛秧鸡/粗毛秧鸡（`ec015_00` / `ec015_01`）、化石腔棘鱼（`ec017`）、月羽天母（`ec058`）、小蓝歌（`ec055`）、虹色大独角仙（`ec023_02`）、野槌蛇（`ec042`）、温泉金猴（`ec050_01`）、神带鱼（`ec056`）等稀有环境生物，**额外大型个体鱼**（上等粉色异形鱼、帝王旗鱼等）以及**聚魔之地毛吉洞（`ec059`）**激活。
+   - **前置非 RNG 门控**：在调用 `nrand` 之前，引擎先校验聚魔地区等级（仅 `ec059`）、目标天气（`RareSetData+0x08`：`0` 任意 / `1` 晴天 / `2` 特殊天气）以及游戏时段（`[mStartTime, mEndTime)`），随后将基础概率与任务、重要委托、猫饭（生物博士/生物研究者）加成求和后放入 `XMM6`。
+   - **纯粹判定**：`(float)nrand() * 2^-32 <= XMM6`。插件采取**纯 RNG 模式**，不绕过原版天气/时段/聚魔等级规则：开启强制刷出时返回 `0x00000001U`（$2^{-32}$，对一切 `prob > 0` 必中且跳过 `0.0f` 禁用行）；开启屏蔽时返回 `0xFFFFFFFFU`（`1.0f`，屏蔽一切 `< 100%` 配置）。
+2. **聚魔之地地区稀有毛吉判定（`0x140271ce0` @ `RVA 0x0271F25`）**：
+   - 毛吉洞激活后单独抽一次普通毛吉（状态 `8`）还是地区稀有毛吉（状态 `7`，需满足地区等级与天气条件；变种由 `animalType` 决定，如 `ec059_02` 掘土毛吉），从 `R15` (`cAnimalGroupCtrlEc059+0x328..0x330`) 读出物种与地区编号。
+3. **族群级稀有可用判定（`FUN_14166d070` @ `RVA 0x166D12E`）**：
+   - 仅从 `0x140271F90` 调用，通过校验返回地址 `slotPtr[12] == exeBase + 0x0271FFFU` 从 `slotPtr[13]` 安全读出 `cAnimalGroupCtrl*` 并应用同样规则。
+4. **互斥稀有组保底抽签（`FUN_141a44f50` @ `RVA 0x1A44FCC`）**：
+   - 原版将整个互斥组（包含未刷出的空槽位）统一做 `nrand() % groupCount`，若落到空槽位会把同组刚刷出的稀有生物删掉。
+   - 插件在 `RVA 0x1A44FCC` 遍历 `sAnimal + 0x70A8 + slotIdx*0xD0` 中所有 `justRolledActive != 0` 的已命中槽位，优先挑出匹配**物种专属强制规则**（其次匹配全局强制）的下标返回，确保强刷的稀有生物不被互斥组误杀。
 
 ---
 
-## 三、命令参考手册（`$rng endemic`）
+## 三、插件实现与安全边界设计（尺寸控制）
 
+- **栈帧上下文溯源与隔离**：`0x166CFE1` 校验 `slotPtr[24]`、`0x0672FBC` 校验 `slotPtr[10]`、`0x166D12E` 校验 `slotPtr[12]`，其余无关调用来源直接放行。
+- **实时中点求解**：大小金档位读取实时 `SizeSetData::prob[3]` 与猫饭/悬赏栈上加成 `bonus[3]` 计算中点，不受体型猫饭偏移，且自动跳过无该档位（概率为 `0`）的配置。
+- **同线程两阶段衔接**：使用 `thread_local` 将档位阶段识别的物种与精确反算 `uint32_t` 传给同线程紧随其后的档内插值阶段。
+- **严格叶互斥锁**：所有回调严格先释放 `g_stateMx` 再调用 `g_host->ChatPrintfAsync` 或 `DrawDeterministic`。
+
+---
+
+## 四、命令参考手册（`$rng endemic`）
+
+### 1. 尺寸与大小金控制
 | 命令格式 | 作用说明 |
 | :--- | :--- |
-| `$rng endemic` 或 `$rng endemic status` | 查看全局策略、按物种专属规则列表及最近一次环境生物抽取记录 |
-| `$rng endemic history` | 查看最近最多 6 条环境生物刷新/捕获记录（含 `ecXXX_YY` 代号、允许 `cm` 范围与抽出尺寸） |
-| `$rng endemic min [0~100]`（别名 `mini` / `small`） | 锁定小金档，可选指定档内位置比例（默认 `0%`，即最小合法尺寸） |
+| `$rng endemic` 或 `$rng endemic status` | 查看全局尺寸策略、稀有生成开关状态、专属规则及最近记录 |
+| `$rng endemic history` | 查看最近最多 6 条环境生物尺寸刷新/捕获记录 |
+| `$rng endemic min [0~100]`（别名 `mini` / `small`） | 锁定小金档，可选指定档内位置比例（默认 `0%`） |
 | `$rng endemic normal [0~100]`（别名 `mid` / `std`） | 锁定普通档，可选指定档内位置比例（默认 `50%`） |
-| `$rng endemic max [0~100]`（别名 `giant` / `large`） | 锁定大金档，可选指定档内位置比例（默认 `100%`，即最大合法尺寸） |
-| `$rng endemic exact <倍率\|百分比\|cm>` | 读取实时 `rAnimalSize` 自动选择对应档位并反算精确倍率或厘米数（例：`exact 1.2x`、`exact 120%`、`exact 25.5cm`） |
-| `$rng endemic <物种代号> <策略\|clear>` | 仅对指定环境生物生效，同场其它环境生物保持正常随机 |
-| `$rng endemic clear` / `off` / `reset` | 清空全部环境生物尺寸规则，恢复默认随机 |
+| `$rng endemic max [0~100]`（别名 `giant` / `large`） | 锁定大金档，可选指定档内位置比例（默认 `100%`） |
+| `$rng endemic exact <倍率\|百分比\|cm>` | 自动选档并反算精确倍率或厘米数（例：`exact 1.2x`、`exact 120%`、`exact 25.5cm`） |
+| `$rng endemic <物种代号> <策略\|clear>` | 仅对指定环境生物生效（如 `$rng endemic ec059 max`） |
+| `$rng endemic clear` / `off` / `reset` | 清空全部尺寸**与**稀有生成规则，恢复默认随机 |
 
-### 物种代号选择器写法
-可使用 `$rng endemic history` 直接查看刚刷出或捕获的环境生物代号，然后按以下格式指定：
-- **整类匹配（含所有变种）**：`ec059`、`ec59`、`#59` 或 `ec059*`（例如锁定全部聚魔之地鼹鼠变种）。
-- **单变种精确匹配**：`ec059_02`、`ec59_2` 或 `59:2`（仅锁定 `animalId == 59` 且 `animalType == 2` 的个体）。
+### 2. 稀有环境生物生成控制（纯 RNG 模式）
+| 命令格式 | 作用说明 |
+| :--- | :--- |
+| `$rng endemic rare` 或 `$rng endemic rare status` | 查看全局稀有生成策略、专属规则与最近抽签结果 |
+| `$rng endemic rare on`（别名 `100` / `100%` / `force`） | 全局强制稀有生物 **100% 必刷**（需满足原版天气/时段/聚魔等级，自动保护互斥组） |
+| `$rng endemic rare 0%`（别名 `0` / `block` / `none`） | 全局屏蔽稀有生物刷出（概率压至 `0%`） |
+| `$rng endemic rare off`（别名 `clear` / `reset`） | 仅清空稀有生成规则（不影响大小金尺寸规则） |
+| `$rng endemic rare <物种> <on\|0%\|off>` | 按物种覆盖稀有生成（如 `$rng endemic rare 月羽天母 on`、`$rng endemic rare ec015_01 0%`、`$rng endemic rare rocky_moly on`） |
+| `$rng endemic <物种代号> rare [on\|0%\|off]` | 同上等价写法，省略后缀时默认设为 `on` |
+| `$rng endemic rare log [on\|off]` | 开启/关闭或切换稀有判定实时聊天框播报 |
+| `$rng endemic rare history` | 查看最近最多 12 条稀有生成、地区稀有毛吉与互斥组抽签记录 |
+
+### 物种选择器写法
+可使用 `$rng endemic history` 或 `$rng endemic rare history` 查看刷出物种（会显示 `ec059_02(掘土毛吉)` 这样的代号+名称）：
+- **单变种精确匹配**：`ec059_02`、`ec59_2`、`59:2`，或直接写游戏内名称 `掘土毛吉` / 英文别名 `rocky_moly`
+- **整类匹配（含所有变种）**：`ec059`、`ec59`、`#59`、`ec059*`，或名称加星号 `毛吉*` / `moly*`
+- 名称来自游戏自身的图鉴与道具文本（简中 + 英文，共 92 条，见 `endemic_names.inl`）；英文别名为英文名小写并以下划线连接（如 `wintermoon_nettle`、`sealords_crestfish`）。
+- 控制台 Tab 补全：`$rng endemic ` / `$rng endemic clear ` 后直接按 Tab 会列出全部 92 个物种名称（当前界面语言），`$rng endemic rare ` 后直接按 Tab 会列出图鉴稀有物种与带大型个体的鱼类；输入单个英文字母时仍优先补全短关键字（如 `r` → `rare`），输入 1 个汉字或至少 2 个英文字母后同时补全简中名与英文别名。
 
 ---
 
-## 四、独立仓库目录、头文件同步与构建
-
-本插件目录自带本地 SDK 头文件副本与独立构建脚本，可作为单独的 Git 仓库维护：
+## 五、独立仓库目录、头文件同步与构建
 
 - `endemic_plugin.cpp`：插件主源码
+- `endemic_names.inl`：由游戏数据自动生成的环境生物简中/英文名称表（勿手改）
 - `include/mhw_rng_api.h`：本地携带的 `mhw_rng` Plugin SDK v3 头文件副本
 - `sync_sdk.bat`：从核心框架目录更新 `include\mhw_rng_api.h`
 - `build.bat`：自动查找 MSVC x64 工具链并输出 `build\rng_endemic.dll`
 
 常用命令：
 ```bat
-:: 1. 同步最新 SDK 头文件（默认查找 ..\..\include 或 %MHW_RNG_SDK_DIR%）
+:: 1. 同步最新 SDK 头文件
 sync_sdk.bat <path-to-mhw-rng>
 
 :: 2. 独立编译至 build\rng_endemic.dll
@@ -108,4 +138,4 @@ build.bat
 build.bat --deploy
 ```
 
-部署完成后在游戏聊天框输入 `$rng load endemic`（首次加载）或 `$rng reload endemic`（热更新）即可生效。
+部署完成后在游戏聊天框或内置控制台输入 `$rng reload endemic` 即可热重载生效。
